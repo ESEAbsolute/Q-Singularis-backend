@@ -1,0 +1,16 @@
+# 依赖与构建产物
+node_modules/
+dist/
+dist-test/
+
+# 运行时数据（SQLite、上传视频等，勿入库）
+data/
+data-test/
+
+# 本地配置（.env.example 保留入库）
+.env
+.env.local
+
+*.log
+.DS_Store
+Thumbs.db
