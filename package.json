@@ -16,10 +16,8 @@
   },
   "dependencies": {
     "@elysia/node": "^1.4.6",
-    "elysia": "^1.4.30"
-  },
-  "devDependencies": {
     "@types/node": "^24.0.0",
+    "elysia": "^1.4.30",
     "tsx": "^4.19.0",
     "typescript": "^5.9.0"
   }
