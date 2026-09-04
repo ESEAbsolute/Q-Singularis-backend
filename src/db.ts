@@ -32,6 +32,7 @@ CREATE TABLE submissions (
   complete      INTEGER NOT NULL DEFAULT 0,
   values_json   TEXT,          -- 刊登后聚合的 raw 值 {key:number}
   notes_json    TEXT NOT NULL DEFAULT '{}',  -- 玩家提交说明 {key: {text, images[]}}（图片审核完成后即删）
+  partial_base_id INTEGER,     -- 部分更新投稿的基底投稿 id（沿用其未更新项的视频）
   created_at    INTEGER NOT NULL,
   published_at  INTEGER,
   rejected_at   INTEGER,
@@ -101,6 +102,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   complete      INTEGER NOT NULL DEFAULT 0,
   values_json   TEXT,
   notes_json    TEXT NOT NULL DEFAULT '{}',
+  partial_base_id INTEGER,
   created_at    INTEGER NOT NULL,
   published_at  INTEGER,
   rejected_at   INTEGER,
@@ -190,6 +192,22 @@ function migrateAddNotesColumn(): void {
 }
 
 migrateAddNotesColumn();
+
+/** v2.3 老库补列：submissions 缺 partial_base_id（部分更新基底）时 ALTER 追加 */
+function migrateAddPartialBaseColumn(): void {
+  const hasTable = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='submissions'")
+    .get();
+  if (!hasTable) return;
+  const cols = new Set(
+    (db.prepare('PRAGMA table_info(submissions)').all() as { name: string }[]).map((c) => c.name)
+  );
+  if (cols.has('partial_base_id')) return;
+  console.log('[db] 检测到 submissions 缺少 partial_base_id，正在补充列…');
+  db.exec('ALTER TABLE submissions ADD COLUMN partial_base_id INTEGER;');
+}
+
+migrateAddPartialBaseColumn();
 
 // ---------------------------------------------------------------------------
 // 种子赛季：若没有任何赛季，创建「第 0 期」演示配置

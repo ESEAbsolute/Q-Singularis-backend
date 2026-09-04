@@ -8,7 +8,15 @@
 //   HLS 产物 media/<seasonId>/<storedName>/index.m3u8 + seg_*.ts
 // 说明：转码成功即删除原文件（HLS 播放已足够）；R2 模式仅存 HLS。
 // ===========================================================================
-import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import {
+  readFileSync,
+  existsSync,
+  readdirSync,
+  statSync,
+  copyFileSync,
+  cpSync,
+  mkdirSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { env } from '../env.js';
 import { removeDirIfExists } from './ffmpeg.js';
@@ -208,7 +216,55 @@ export function originalExists(seasonId: number, storedName: string): boolean {
   return existsSync(originalPath(seasonId, storedName));
 }
 
-// 供调用方展示与判断
+// ---------------------------------------------------------------------------
+// 复制（部分更新投稿：沿用基底投稿中未更新项的视频）
+// ---------------------------------------------------------------------------
+
+/** 复制本地原文件（fromName → toName） */
+export function copyOriginalFile(
+  seasonId: number,
+  fromName: string,
+  toName: string
+): void {
+  const src = originalPath(seasonId, fromName);
+  if (!existsSync(src)) throw new Error(`原文件不存在：${fromName}`);
+  const dst = originalPath(seasonId, toName);
+  mkdirSync(join(env.uploadDir, String(seasonId)), { recursive: true });
+  copyFileSync(src, dst);
+}
+
+/**
+ * 复制 HLS 产物（fromName → toName）：
+ * - 本地有目录 → 直接目录复制；
+ * - R2 模式且本地无副本 → R2 前缀内逐对象复制（media/<season>/<name>/ → <newname>/）。
+ */
+export async function copyHlsDir(
+  seasonId: number,
+  fromName: string,
+  toName: string
+): Promise<void> {
+  const fromDir = hlsLocalDir(seasonId, fromName);
+  if (existsSync(fromDir)) {
+    const toDir = hlsLocalDir(seasonId, toName);
+    mkdirSync(join(toDir, '..'), { recursive: true });
+    cpSync(fromDir, toDir, { recursive: true });
+    return;
+  }
+  if (r2Enabled()) {
+    const prefix = `media/${seasonId}/${fromName}/`;
+    const keys = await r2List(prefix);
+    if (!keys.length) throw new Error(`R2 HLS 不存在：${fromName}`);
+    for (const key of keys) {
+      const file = key.slice(prefix.length);
+      const body = await r2Get(key);
+      if (body) await r2Put(`media/${seasonId}/${toName}/${file}`, body);
+    }
+    return;
+  }
+  throw new Error(`HLS 产物不存在：${fromName}`);
+}
+
+/** 供调用方展示与判断 */
 export function transcodeStatusOf(f: SubFile): TranscodeState {
   const s = f?.transcode;
   if (s === 'pending' || s === 'processing' || s === 'done' || s === 'failed') return s;

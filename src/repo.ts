@@ -21,7 +21,7 @@ const USER_COLS =
   'qq, password_hash AS passwordHash, role, status, game_id AS gameId, auth_uuid AS authUuid, created_at AS createdAt, verified_at AS verifiedAt';
 const SEASON_COLS = 'id, name, status, config, created_at AS createdAt, archived_at AS archivedAt';
 const SUB_COLS =
-  'id, season_id AS seasonId, user_qq AS userQq, status, files_json AS filesJson, complete, values_json AS valuesJson, notes_json AS notesJson, created_at AS createdAt, published_at AS publishedAt, rejected_at AS rejectedAt, rejected_by AS rejectedBy, reject_reason AS rejectReason';
+  'id, season_id AS seasonId, user_qq AS userQq, status, files_json AS filesJson, complete, values_json AS valuesJson, notes_json AS notesJson, partial_base_id AS partialBaseId, created_at AS createdAt, published_at AS publishedAt, rejected_at AS rejectedAt, rejected_by AS rejectedBy, reject_reason AS rejectReason';
 const REVIEW_COLS =
   'id, submission_id AS submissionId, reviewer_qq AS reviewerQq, values_json AS valuesJson, comment, created_at AS createdAt, updated_at AS updatedAt';
 const MANUAL_COLS =
@@ -323,13 +323,22 @@ export function purgeSubmissionNoteImages(sub: SubmissionRow): void {
 export function createSubmission(params: {
   seasonId: number;
   userQq: string;
+  partialBaseId?: number | null;
 }): SubmissionRow {
   const info = db
     .prepare(
-      `INSERT INTO submissions (season_id, user_qq, status, files_json, complete, values_json, created_at, published_at, rejected_at, rejected_by, reject_reason)
-       VALUES (?,?,?,?,?,NULL,?,NULL,NULL,NULL,NULL)`
+      `INSERT INTO submissions (season_id, user_qq, status, files_json, complete, values_json, notes_json, partial_base_id, created_at, published_at, rejected_at, rejected_by, reject_reason)
+       VALUES (?,?,?,?,?,NULL,'{}',?,?,NULL,NULL,NULL,NULL)`
     )
-    .run(params.seasonId, params.userQq, 'pending', '{}', 0, now());
+    .run(
+      params.seasonId,
+      params.userQq,
+      'pending',
+      '{}',
+      0,
+      params.partialBaseId ?? null,
+      now()
+    );
   const id = Number(info.lastInsertRowid);
   const row = findSubmission(id);
   if (!row) throw new Error('创建投稿失败');
@@ -340,7 +349,12 @@ export function createSubmission(params: {
 export function attachSubmissionFile(params: {
   submissionId: number;
   key: string;
-  file: { originalName: string; storedName: string; sizeBytes: number; transcode?: string };
+  file: {
+    originalName: string | null;
+    storedName: string;
+    sizeBytes: number;
+    transcode?: string;
+  };
 }): { sub: SubmissionRow; previous: import('./types.js').SubFile | null } {
   const sub = findSubmission(params.submissionId);
   if (!sub) throw notFound('投稿不存在');
@@ -434,7 +448,7 @@ export function findPendingSubmission(seasonId: number, userQq: string): Submiss
   );
 }
 
-/** 某玩家在该赛季 0 审的任意待审投稿（含上传中草稿） */
+/** 某玩家在该赛季 0 审的任意待审投稿（含上传中草稿；取最新一条） */
 export function findAnyPendingSubmission(
   seasonId: number,
   userQq: string
@@ -444,11 +458,19 @@ export function findAnyPendingSubmission(
       `SELECT ${SUB_COLS} FROM submissions
         WHERE season_id = ? AND user_qq = ? AND status = 'pending'
           AND NOT EXISTS (SELECT 1 FROM reviews rv WHERE rv.submission_id = submissions.id)
-        LIMIT 1`,
+        ORDER BY id DESC LIMIT 1`,
       seasonId,
       userQq
     ) ?? null
   );
+}
+
+/** 标记投稿为部分更新（写入基底投稿 id） */
+export function setSubmissionPartialBase(submissionId: number, baseId: number): SubmissionRow {
+  db.prepare('UPDATE submissions SET partial_base_id = ? WHERE id = ?').run(baseId, submissionId);
+  const row = findSubmission(submissionId);
+  if (!row) throw notFound('投稿不存在');
+  return row;
 }
 
 export function listSubmissionsByUser(userQq: string): SubmissionRow[] {
@@ -471,6 +493,22 @@ export function listCompleteSubmissions(seasonId: number | null, limit = 500): S
   return many<SubmissionRow>(
     `SELECT ${SUB_COLS} FROM submissions WHERE complete = 1 ORDER BY id DESC LIMIT ?`,
     limit
+  );
+}
+
+/** 玩家在某赛季「最近一次完整投稿」（部分更新的基底；不含已打回） */
+export function findRecentCompleteSubmission(
+  seasonId: number,
+  userQq: string
+): SubmissionRow | null {
+  return (
+    one<SubmissionRow>(
+      `SELECT ${SUB_COLS} FROM submissions
+        WHERE season_id = ? AND user_qq = ? AND complete = 1 AND status IN ('pending','published')
+        ORDER BY id DESC LIMIT 1`,
+      seasonId,
+      userQq
+    ) ?? null
   );
 }
 

@@ -290,6 +290,61 @@ async function main() {
     arch.json
   );
 
+  console.log('== 部分更新：只替换选中的 raw 项 ==');
+  // 第 2 期（damage+time）：先传一份完整基底，并让它脱离 0 审（1 审即刊登快照）
+  const pb1 = await uploadVideo(ownerToken, 'damage', v1, 'pbase-damage.mp4');
+  const pb2 = await uploadVideo(ownerToken, 'time', v2, 'pbase-time.mp4');
+  const pBaseId = pb2.json.submission?.id;
+  check('部分更新基底完整上传', !!pBaseId && pb2.json.complete === true, pb2.json);
+  const pRev = await api(`/api/staff/reviews/${pBaseId}`, {
+    method: 'POST',
+    token: suLogin.token,
+    body: { values: { damage: 300, time: 33 } },
+  });
+  check('基底 1 审（脱离 0 审后即可部分更新）', pRev.json.reviewCount === 1, pRev.json);
+
+  // partial/start：只更新 time，damage 应从基底复制
+  const ps = await api('/api/submissions/partial/start', {
+    method: 'POST',
+    token: ownerToken,
+    body: { keys: ['time'] },
+  });
+  check('partial/start 成功', ps.json.ok === true && !!ps.json.submission?.id, ps.json);
+  const pDraftId = ps.json.submission?.id;
+  check(
+    '未更新项 damage 视频已从基底复制',
+    ps.json.submission?.files?.damage?.available === true &&
+      ps.json.submission?.files?.time === undefined,
+    ps.json.submission?.files
+  );
+  check('部分更新稿 complete=false（time 待上传）', ps.json.submission?.complete === false, ps.json.submission);
+  check('返回基底信息（审核页可一键带入）', ps.json.base?.id === pBaseId && ps.json.base?.values?.damage === 300, ps.json.base);
+
+  // 只上传新的 time 视频 → 自动落到部分更新草稿并 complete
+  const pNew = await uploadVideo(ownerToken, 'time', new TextEncoder().encode('new-time-video'), 'new-time.mp4');
+  check(
+    '新 time 上传后 complete=true 且复用草稿',
+    pNew.json.complete === true && pNew.json.submission?.id === pDraftId,
+    pNew.json
+  );
+  const pDetail = await api(`/api/submissions/${pDraftId}`, { token: ownerToken });
+  check('detail 返回 partialBase（供审核页提示）', pDetail.json.partialBase?.id === pBaseId, pDetail.json.partialBase);
+  const pMine = await api('/api/submissions/mine', { token: ownerToken });
+  const pMineItem = pMine.json.submissions?.find((s: { id: number }) => s.id === pDraftId);
+  check('mine 标记 partialBaseId', pMineItem?.partialBaseId === pBaseId, pMineItem);
+  const pBad = await api('/api/submissions/partial/start', {
+    method: 'POST',
+    token: ownerToken,
+    body: { keys: ['nope'] },
+  });
+  check('未知 key 的部分更新被拒', pBad.status === 400, pBad.json);
+  const pFull = await api('/api/submissions/partial/start', {
+    method: 'POST',
+    token: ownerToken,
+    body: { keys: ['damage', 'time'] },
+  });
+  check('已存在 0 审完整投稿时部分更新 409（与普通上传同规则）', pFull.status === 409, pFull.json);
+
   console.log('== 表达式扩展：raw key + max/min ==');
   const exprSeason = await api('/api/su/seasons/next', {
     method: 'POST',

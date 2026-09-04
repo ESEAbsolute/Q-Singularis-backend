@@ -90,6 +90,7 @@ export interface SubmissionRow {
   filesJson: string | null; // {"rawKey": {originalName,storedName,sizeBytes}}
   valuesJson: string | null; // 审核聚合快照 {key: number}（≥1 审写入，满 3 审定格）
   notesJson: string | null; // {"rawKey": {text, images[]}}
+  partialBaseId: number | null; // 部分更新投稿的基底投稿 id（未更新项沿用其视频）
   createdAt: number;
   publishedAt: number | null;
   rejectedAt: number | null;

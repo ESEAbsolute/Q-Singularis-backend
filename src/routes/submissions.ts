@@ -8,6 +8,8 @@ import {
   findSubmission,
   findPendingSubmission,
   findAnyPendingSubmission,
+  findRecentCompleteSubmission,
+  setSubmissionPartialBase,
   listSubmissionsByUser,
   deleteSubmissionRow,
   listReviews,
@@ -42,6 +44,8 @@ import {
   readHlsPlaylist,
   readHlsSegment,
   deleteMediaAll,
+  copyOriginalFile,
+  copyHlsDir,
 } from '../lib/mediaStore.js';
 import type { UserRow, SubmissionRow, SubFiles, SubFile } from '../types.js';
 import { readFileSync, createReadStream } from 'node:fs';
@@ -120,6 +124,7 @@ function subMeta(sub: SubmissionRow, seasonName?: string | null, seasonStatus?: 
     seasonStatus: seasonStatus ?? null,
     status: sub.status,
     complete: sub.complete === 1,
+    partialBaseId: sub.partialBaseId ?? null,
     files: fileMeta(files),
     videoAvailable: Object.values(files).some((f) => f.storedName),
     notes: notesView(sub),
@@ -222,6 +227,112 @@ export const submissionRoutes = new Elysia({ prefix: '/api' })
     };
   })
 
+  // ---------- 部分更新：以最近一次完整投稿为基底，仅替换选中的 raw 项视频 ----------
+  // 未选中的 raw 项沿用基底视频（物理复制；R2 模式复制到新 key）。
+  // - 复用「进行中的草稿」：普通草稿就地升级为部分更新稿；已存在的部分更新稿可续传
+  // - 创建后按常规方式逐个上传所选 key 的视频（自动复用本草稿），全部齐备即进入审核池
+  .post('/submissions/partial/start', async ({ headers, body }: any) => {
+    const u = requireUser(authUser(headers));
+    if (u.status !== 'verified') throw forbidden('请先完成 QQ 验证');
+    if (!u.gameId) throw badRequest('请先在个人中心绑定游戏ID再上传');
+    const season = activeSeason();
+    if (!season) throw conflict('当前没有进行中的赛季，无法上传');
+    const cfg = seasonConfig(season);
+    const allKeys = cfg.items.map((i) => i.key);
+    const rawKeys = (body ?? {}).keys;
+    if (!Array.isArray(rawKeys) || rawKeys.length === 0) {
+      throw badRequest('请选择要更新的测试项（keys）');
+    }
+    const keys = [...new Set(rawKeys.map((k) => String(k)))];
+    for (const k of keys) {
+      if (!allKeys.includes(k)) throw badRequest(`未知测试项 "${k}"`);
+    }
+
+    // 已有 0 审完整投稿：规则同普通上传（先决定保留哪一份）
+    if (findPendingSubmission(season.id, u.qq)) {
+      throw conflict('已有待审核投稿，请先决定保留哪一份');
+    }
+
+    // 进行中草稿（0 审任意）优先复用；否则新建
+    let draft = findAnyPendingSubmission(season.id, u.qq);
+    const recent = findRecentCompleteSubmission(season.id, u.qq);
+    // 基底：已存在的部分更新稿沿用其基底；否则取最近完整投稿
+    let base: SubmissionRow | null = null;
+    if (draft?.partialBaseId) base = findSubmission(draft.partialBaseId);
+    if (!base) base = recent;
+    if (!base) {
+      throw badRequest('本季还没有可沿用的完整投稿，请直接完整上传');
+    }
+    const created = !draft;
+    if (!draft) {
+      draft = createSubmission({ seasonId: season.id, userQq: u.qq, partialBaseId: base.id });
+    } else if (!draft.partialBaseId) {
+      // 普通草稿就地升级为部分更新稿（草稿中已有的文件保留，若属于 keys 会由后续上传覆盖）
+      draft = setSubmissionPartialBase(draft.id, base.id);
+    }
+
+    // 复制基底中 draft 缺失且不在本次更新列表内的视频
+    const draftFiles = subFiles(draft);
+    const baseFiles = subFiles(base);
+    const copiedKeys: string[] = [];
+    try {
+      for (const [key, f] of Object.entries(baseFiles)) {
+        if (!f?.storedName || keys.includes(key) || draftFiles[key]) continue;
+        const state = transcodeStatusOf(f);
+        const newName = genStoredName(f.originalName ?? `${key}.mp4`);
+        if (state === 'done') {
+          await copyHlsDir(season.id, f.storedName, newName);
+          attachSubmissionFile({
+            submissionId: draft.id,
+            key,
+            file: {
+              originalName: f.originalName,
+              storedName: newName,
+              sizeBytes: f.sizeBytes ?? 0,
+              transcode: 'done',
+            },
+          });
+        } else {
+          // off / pending / failed 均以本地原文件为准
+          copyOriginalFile(season.id, f.storedName, newName);
+          attachSubmissionFile({
+            submissionId: draft.id,
+            key,
+            file: {
+              originalName: f.originalName,
+              storedName: newName,
+              sizeBytes: f.sizeBytes ?? 0,
+              // 重新参与转码排队（成功后会删原文件；失败回退原文件）
+              transcode: ffmpegAvailable() ? 'pending' : 'off',
+            },
+          });
+        }
+        copiedKeys.push(key);
+      }
+    } catch (e) {
+      // 复制中途失败：若是本次新建的投稿则清理；已存在的草稿保留已复制部分可重试
+      if (created) {
+        const df = subFiles(findSubmission(draft!.id) ?? draft!);
+        for (const f of Object.values(df)) {
+          if (f?.storedName) await deleteMediaAll(season.id, f.storedName);
+        }
+        deleteSubmissionRow(draft!.id);
+      }
+      throw e;
+    }
+    const final = findSubmission(draft!.id)!;
+    return {
+      ok: true,
+      created,
+      submission: subMeta(final, season.name, season.status),
+      base: {
+        id: base.id,
+        values: base.valuesJson ? JSON.parse(base.valuesJson) : null,
+      },
+      copiedKeys,
+    };
+  })
+
   // ---------- 投稿详情（本人 / 管理员） ----------
   .get('/submissions/:id', ({ params, headers }: any) => {
     const u = requireUser(authUser(headers));
@@ -247,6 +358,8 @@ export const submissionRoutes = new Elysia({ prefix: '/api' })
       values: JSON.parse(r.valuesJson),
       updatedAt: r.updatedAt,
     }));
+    // 部分更新投稿：附带基底投稿（供审核页展示「沿用上次数值」）
+    const partialBase = sub.partialBaseId ? findSubmission(sub.partialBaseId) : null;
     return {
       ok: true,
       submission: subMeta(sub, season?.name, season?.status),
@@ -255,6 +368,12 @@ export const submissionRoutes = new Elysia({ prefix: '/api' })
         : null,
       reviewCount: reviewers.length,
       reviewers,
+      partialBase: partialBase
+        ? {
+            id: partialBase.id,
+            values: partialBase.valuesJson ? JSON.parse(partialBase.valuesJson) : null,
+          }
+        : null,
     };
   })
 
