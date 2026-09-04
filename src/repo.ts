@@ -8,7 +8,7 @@ import type {
   SeasonConfig,
 } from './types.js';
 import { computeScores, fmt1, round1 } from './lib/scoring.js';
-import { aggregateReviews } from './lib/aggregate.js';
+import { aggregateReviews, AggregateError } from './lib/aggregate.js';
 import { notFound, forbidden, conflict } from './lib/errors.js';
 import { env } from './env.js';
 import { hashPassword, randomToken, randomUuid } from './lib/crypto.js';
@@ -99,14 +99,6 @@ export function listUsers(q: string): UserRow[] {
     );
   }
   return many<UserRow>(`SELECT ${USER_COLS} FROM users ORDER BY created_at`);
-}
-
-/** 有效管理员（admin/su 且已验证）数量：用于决定审核刊登阈值 */
-export function countActiveStaff(): number {
-  const row = one<{ c: number }>(
-    "SELECT COUNT(*) AS c FROM users WHERE role IN ('admin','su') AND status = 'verified'"
-  );
-  return row?.c ?? 0;
 }
 
 export function publicUser(u: UserRow) {
@@ -292,25 +284,31 @@ export function findSubmission(id: number): SubmissionRow | null {
   return one<SubmissionRow>(`SELECT ${SUB_COLS} FROM submissions WHERE id = ?`, id) ?? null;
 }
 
-/** 某玩家在该赛季「已齐全」的待审投稿 */
+/** 某玩家在该赛季「0 审」的待审投稿（未开始审核、尚未刊登，占用上传名额） */
 export function findPendingSubmission(seasonId: number, userQq: string): SubmissionRow | null {
   return (
     one<SubmissionRow>(
-      `SELECT ${SUB_COLS} FROM submissions WHERE season_id = ? AND user_qq = ? AND status = 'pending' AND complete = 1 LIMIT 1`,
+      `SELECT ${SUB_COLS} FROM submissions
+        WHERE season_id = ? AND user_qq = ? AND status = 'pending' AND complete = 1
+          AND NOT EXISTS (SELECT 1 FROM reviews rv WHERE rv.submission_id = submissions.id)
+        LIMIT 1`,
       seasonId,
       userQq
     ) ?? null
   );
 }
 
-/** 某玩家在该赛季任意待审投稿（含上传中 complete=0 的草稿） */
+/** 某玩家在该赛季 0 审的任意待审投稿（含上传中草稿） */
 export function findAnyPendingSubmission(
   seasonId: number,
   userQq: string
 ): SubmissionRow | null {
   return (
     one<SubmissionRow>(
-      `SELECT ${SUB_COLS} FROM submissions WHERE season_id = ? AND user_qq = ? AND status = 'pending' LIMIT 1`,
+      `SELECT ${SUB_COLS} FROM submissions
+        WHERE season_id = ? AND user_qq = ? AND status = 'pending'
+          AND NOT EXISTS (SELECT 1 FROM reviews rv WHERE rv.submission_id = submissions.id)
+        LIMIT 1`,
       seasonId,
       userQq
     ) ?? null
@@ -324,7 +322,7 @@ export function listSubmissionsByUser(userQq: string): SubmissionRow[] {
   );
 }
 
-/** 审核队列：该赛季所有已齐全的 pending */
+/** 审核队列：该赛季所有已齐全的 pending（0~2 审，含快照刊登等待补审的投稿） */
 export function listPendingSubmissions(seasonId: number): SubmissionRow[] {
   return many<SubmissionRow>(
     `SELECT ${SUB_COLS} FROM submissions WHERE season_id = ? AND status = 'pending' AND complete = 1 ORDER BY id`,
@@ -332,9 +330,13 @@ export function listPendingSubmissions(seasonId: number): SubmissionRow[] {
   );
 }
 
-export function listPublishedSubmissions(seasonId: number): SubmissionRow[] {
+/** 榜单数据源：pending(已刊登未满3审) 与 published(满3审) 都参与 */
+export function listRankedSubmissions(seasonId: number): SubmissionRow[] {
   return many<SubmissionRow>(
-    `SELECT ${SUB_COLS} FROM submissions WHERE season_id = ? AND status = 'published' ORDER BY id`,
+    `SELECT ${SUB_COLS} FROM submissions
+      WHERE season_id = ? AND complete = 1 AND values_json IS NOT NULL
+        AND status IN ('pending','published')
+      ORDER BY id`,
     seasonId
   );
 }
@@ -354,7 +356,8 @@ export function markRejected(params: {
   if (sub.status !== 'pending') throw conflict('只有待审核的投稿可以打回');
   const t = now();
   db.prepare(
-    "UPDATE submissions SET status = 'rejected', files_json = '{}', complete = 0, rejected_at = ?, rejected_by = ?, reject_reason = ? WHERE id = ?"
+    `UPDATE submissions SET status = 'rejected', files_json = '{}', values_json = NULL, complete = 0,
+       published_at = NULL, rejected_at = ?, rejected_by = ?, reject_reason = ? WHERE id = ?`
   ).run(t, params.by, params.reason ?? null, params.submissionId);
   return findSubmission(params.submissionId)!;
 }
@@ -408,25 +411,38 @@ export function countDistinctReviewers(submissionId: number): number {
 }
 
 /**
- * 达到 3 份审核时发布：逐字段聚合，写回 submission。
- * @returns 聚合出的 raw 值
+ * 快照刊登（每次有审核提交/更新后都会执行）：
+ * - 聚合当前全部审核（1 人直取 / 2 人平均 / 3 人众数或最近平均），立即写入 values_json
+ *   （投稿随即出现在榜单，标注「审核 X/3」）；
+ * - 审满 3 份（强制目标）→ status='published'（终态定格，从审核池移除）；
+ * - 不足 3 份 → 保持 'pending'，留在审核池等待更多审核。
+ * @returns 聚合出的 raw 值 + 当前审核数 + 是否已满 3 审定格
  */
-export function publishSubmission(submissionId: number): Record<string, number> {
+export function publishSubmission(submissionId: number): {
+  values: Record<string, number>;
+  reviewCount: number;
+  locked: boolean;
+} {
   const sub = findSubmission(submissionId);
   if (!sub) throw notFound('投稿不存在');
+  if (sub.status !== 'pending') throw conflict('只有待审核的投稿可以刊登');
   const season = findSeason(sub.seasonId);
   if (!season) throw notFound('赛季不存在');
   const cfg = seasonConfig(season);
 
   const reviews = listReviews(submissionId);
+  if (reviews.length === 0) throw new AggregateError('还没有审核记录，无法刊登');
   const reviewValues = reviews.map((r) => JSON.parse(r.valuesJson) as Record<string, number>);
   const keys = cfg.items.map((it) => it.key);
   const aggregated = aggregateReviews(reviewValues, keys);
+
+  const reviewCount = reviews.length; // 每人一条（UNIQUE submission+reviewer），即不同审核人数
+  const locked = reviewCount >= 3;
   const t = now();
   db.prepare(
-    "UPDATE submissions SET status = 'published', values_json = ?, published_at = ? WHERE id = ?"
-  ).run(JSON.stringify(aggregated), t, submissionId);
-  return aggregated;
+    `UPDATE submissions SET status = ?, values_json = ?, published_at = COALESCE(published_at, ?) WHERE id = ?`
+  ).run(locked ? 'published' : 'pending', JSON.stringify(aggregated), t, submissionId);
+  return { values: aggregated, reviewCount, locked };
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +499,8 @@ export interface BoardCandidate {
   manual: boolean;
   submissionId: number | null;
   publishedAt: number | null;
+  /** 该成绩经过几位管理员审核（manual 为 0） */
+  reviewCount: number;
 }
 
 /** 依据赛季配置，从 raw 值计算 sc_i 与总分 */
@@ -494,14 +512,14 @@ export function computeFromValues(cfg: SeasonConfig, values: Record<string, numb
 /**
  * 组装某一期榜单：
  * - 若存在 manual_scores（手动改分）→ 以手动值为准（覆盖审核成绩）；
- * - 否则取该用户得分最高的 published 投稿（每用户仅一条上榜）。
+ * - 否则取该用户得分最高的投稿（含 1-2 审快照刊登与满 3 审定格成绩，每用户仅一条上榜）。
  */
 export function assembleBoard(seasonId: number): BoardCandidate[] {
   const season = findSeason(seasonId);
   if (!season) throw notFound('赛季不存在');
   const cfg = seasonConfig(season);
 
-  const published = listPublishedSubmissions(seasonId);
+  const published = listRankedSubmissions(seasonId);
   const manualRows = many<ManualScoreRow>(
     `SELECT ${MANUAL_COLS} FROM manual_scores WHERE season_id = ?`,
     seasonId
@@ -514,8 +532,17 @@ export function assembleBoard(seasonId: number): BoardCandidate[] {
     if (!sub.valuesJson) continue;
     const values = JSON.parse(sub.valuesJson) as Record<string, number>;
     const { scores, total } = computeFromValues(cfg, values);
+    const reviewCount = countDistinctReviewers(sub.id);
     const prev = bestByUser.get(sub.userQq);
-    if (!prev || total > prev.total) {
+    // 分数更高优先；同分时选审核份数更多、且更早刊登的一条
+    const better =
+      !prev ||
+      total > prev.total ||
+      (total === prev.total &&
+        (reviewCount > prev.reviewCount ||
+          (reviewCount === prev.reviewCount &&
+            (sub.publishedAt ?? 0) < (prev.publishedAt ?? 0))));
+    if (better) {
       bestByUser.set(sub.userQq, {
         userQq: sub.userQq,
         values,
@@ -524,6 +551,7 @@ export function assembleBoard(seasonId: number): BoardCandidate[] {
         manual: false,
         submissionId: sub.id,
         publishedAt: sub.publishedAt,
+        reviewCount,
       });
     }
   }
@@ -539,6 +567,7 @@ export function assembleBoard(seasonId: number): BoardCandidate[] {
       manual: true,
       submissionId: null,
       publishedAt: null,
+      reviewCount: 0,
     });
   }
   return [...bestByUser.values()];

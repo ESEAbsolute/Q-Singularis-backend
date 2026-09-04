@@ -15,7 +15,12 @@ db.exec('PRAGMA foreign_keys = ON;');
 //   files_json: {"<rawKey>": {originalName, storedName, sizeBytes}}，
 //               旧版(v1)迁移的单视频以 "*" key 存放（历史数据无 rawKey 概念）
 //   status: pending / published / replaced / rejected
+//           pending   = 审核池中（complete=1 可审；有 ≥1 审且未满 3 审时
+//                        values_json 已有快照，成绩已上榜单待补审）
+//           published = 满 3 审后成绩定格（从审核池移除，不可再审/撤销）
 //   complete: 0=素材未齐(上传中) 1=素材齐备(可进审核池)
+//   values_json: 审核聚合快照 {key:number}；≥1 审时由每次审核提交后即时写入，
+//                满 3 审时定格不再变化
 // ---------------------------------------------------------------------------
 const SUB_DDL = `
 CREATE TABLE submissions (

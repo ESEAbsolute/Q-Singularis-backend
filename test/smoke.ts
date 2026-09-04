@@ -190,13 +190,30 @@ async function main() {
     token: suLogin.token,
     body: { values: { damage: 220, time: 40 } },
   });
-  check('第 1 审', rev1.json.reviewCount === 1, rev1.json);
+  check('第 1 审后 reviewCount=1', rev1.json.reviewCount === 1, rev1.json);
+  check(
+    '第 1 审即刊登快照（1 人直取 220/40）',
+    rev1.json.snapshot?.damage === 220 && rev1.json.snapshot?.time === 40 && rev1.json.locked === false,
+    rev1.json
+  );
+  // 1 审后投稿仍留在审核池（等补审），但已出现在榜单
+  const queue1 = await api('/api/staff/reviews', { token: suLogin.token });
+  const inQueue1 = queue1.json.items?.some(
+    (x: { id: number; snapshot: unknown }) => x.id === sid && x.snapshot !== null
+  );
+  check('1 审后仍在审核池且带快照（等待补审）', inQueue1 === true, queue1.json);
+
   const rev2 = await api(`/api/staff/reviews/${sid}`, {
     method: 'POST',
     token: adminBUser.token,
     body: { values: { damage: 220, time: 41 } },
   });
   check('第 2 审', rev2.json.reviewCount === 2, rev2.json);
+  check(
+    '第 2 审后快照刷新（2 人相同则同值 / 平均）',
+    rev2.json.snapshot?.damage === 220 && rev2.json.locked === false,
+    rev2.json
+  );
 
   const adminC = await mkUser(String(rnd + 5));
   await api('/internal/bot/fcadmin', {
@@ -209,15 +226,18 @@ async function main() {
     token: adminC.token,
     body: { values: { damage: 219, time: 40 } },
   });
-  check('第 3 审后刊登', rev3.json.published === true, rev3.json);
+  check('第 3 审后定格（locked）', rev3.json.locked === true, rev3.json);
   check(
     '聚合结果为 220/40（众数）',
-    rev3.json.publishedValues?.damage === 220 && rev3.json.publishedValues?.time === 40,
+    rev3.json.snapshot?.damage === 220 && rev3.json.snapshot?.time === 40,
     rev3.json
   );
 
   const subInfo = await api(`/api/submissions/${sid}`, { token: ownerToken });
-  check('投稿状态 published', subInfo.json.submission?.status === 'published', subInfo.json);
+  check('投稿状态 published（满 3 审移出审核池）', subInfo.json.submission?.status === 'published', subInfo.json);
+
+  const queueAfter = await api('/api/staff/reviews', { token: suLogin.token });
+  check('满 3 审后从审核池移除', !queueAfter.json.items?.some((x: { id: number }) => x.id === sid), queueAfter.json);
 
   console.log('== 排行榜 ==');
   const board = await api('/api/leaderboard', { token: ownerToken });
@@ -233,6 +253,12 @@ async function main() {
   const boardAdmin = await api('/api/leaderboard', { token: suLogin.token });
   const ad0 = boardAdmin.json.rows?.[0]?.detail?.[0];
   check('管理员可看全部 raw/scores', ad0 && ad0.raw !== null && ad0.score !== null, boardAdmin.json);
+  check(
+    '榜单标注 审核 3/3（三审刊登）',
+    boardAdmin.json.rows?.[0]?.manual === false &&
+      boardAdmin.json.rows?.[0]?.reviewCount === 3,
+    boardAdmin.json.rows?.[0]
+  );
 
   console.log('== 排行管理（SU）==');
   const nextCfg = {
@@ -276,7 +302,8 @@ async function main() {
   check('含 raw key/max/min 的表达式建期成功', exprSeason.json.ok === true, exprSeason.json);
   check('第 3 期为 active', exprSeason.json.season?.status === 'active', exprSeason.json);
 
-  console.log('== 有效管理员不足 3 人：1 审即刊登 ==');
+  console.log('== 管理员只有 2 人：仍以 3 审为目标，1/2 审也立即刊登快照 ==');
+  // 有效管理员只剩 adminA(su) + adminDUser(su)：把 adminB/adminC 卸任
   const demoteB = await api(`/api/staff/users/${adminB}/role`, {
     method: 'PATCH',
     token: suLogin.token,
@@ -292,13 +319,46 @@ async function main() {
   const upT = await uploadVideo(ownerToken, 'T', new TextEncoder().encode('video-t'), 'T.mp4');
   const sid3 = upT.json.submission?.id;
   check('第 3 期上传成功', !!sid3, upT.json);
-  const soloReview = await api(`/api/staff/reviews/${sid3}`, {
+
+  // 第 1 审：1 人就刊登快照（58），但未满 3 审不入终态
+  const revA = await api(`/api/staff/reviews/${sid3}`, {
     method: 'POST',
     token: suLogin.token,
-    body: { values: { T: 60 } },
+    body: { values: { T: 58 } },
   });
-  check('仅 1 名管理员审核即刊登(threshold=1)', soloReview.json.published === true && soloReview.json.threshold === 1, soloReview.json);
-  check('刊登聚合值为 60', soloReview.json.publishedValues?.T === 60, soloReview.json);
+  check(
+    '第 1 审即刊登（1 人直取 58，threshold=3）',
+    revA.json.reviewCount === 1 &&
+      revA.json.threshold === 3 &&
+      revA.json.locked === false &&
+      revA.json.snapshot?.T === 58,
+    revA.json
+  );
+  // 第 2 审：adminDUser 审 62 → 平均 (58+62)/2 = 60，快照刷新
+  const revD = await api(`/api/staff/reviews/${sid3}`, {
+    method: 'POST',
+    token: adminDUser.token,
+    body: { values: { T: 62 } },
+  });
+  check('第 2 审后仍未定格（locked=false）', revD.json.locked === false && revD.json.reviewCount === 2, revD.json);
+  check('两人审核取平均为 60', revD.json.snapshot?.T === 60, revD.json);
+
+  const exprSeasonId = exprSeason.json.season?.id;
+  const board2 = await api(`/api/leaderboard?seasonId=${exprSeasonId}`, { token: ownerToken });
+  const row2 = board2.json.rows?.find((r: any) => r.qq === owner);
+  check(
+    '不足 3 审也刊登上榜，标注 审核 2/3',
+    row2 && row2.reviewCount === 2 && row2.manual === false,
+    row2
+  );
+
+  // 仍留在审核池等第 3 审
+  const qMid = await api('/api/staff/reviews', { token: suLogin.token });
+  const sid3InQueue = qMid.json.items?.some((x: { id: number; reviewCount: number }) => x.id === sid3 && x.reviewCount === 2);
+  check('2/3 投稿仍在审核池等待补审', sid3InQueue === true, qMid.json);
+
+  const q1 = await api('/api/staff/reviews', { token: suLogin.token });
+  check('队列 threshold 恒为 3（不再按管理员数缩减）', q1.json.threshold === 3, q1.json);
 
   console.log('== 打回（作弊/无效） ==');
   // 再传一份：管理员 adminA 打回

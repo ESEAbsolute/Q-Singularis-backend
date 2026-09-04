@@ -10,7 +10,6 @@ import {
   countDistinctReviewers,
   publishSubmission,
   findUserByQq,
-  countActiveStaff,
   markRejected,
   subFiles,
 } from '../repo.js';
@@ -24,11 +23,8 @@ function isStaff(u: UserRow | null): boolean {
   return !!u && (u.role === 'admin' || u.role === 'su');
 }
 
-/** 该视频需要几位管理员审核才刊登：有效管理员≥3 → 3 人；不足 3 → 1 人完成即通过 */
-function publishThreshold(): number {
-  const staff = countActiveStaff();
-  return staff >= 3 ? 3 : 1;
-}
+/** 审核目标份数：固定 3 审；不足 3 审时只要有审核即可先刊登（快照），审满后定格 */
+const REVIEW_TARGET = 3;
 
 /** 文件元数据视图（key → 摘要） */
 function filesView(files: SubFiles) {
@@ -63,15 +59,14 @@ function subMeta(sub: SubmissionRow, seasonName?: string | null) {
 }
 
 export const reviewRoutes = new Elysia({ prefix: '/api/staff' })
-  // ---------- 审核队列（管理员；仅展示视频齐全的待审） ----------
+  // ---------- 审核队列（管理员；展示视频齐全且未满 3 审的投稿） ----------
   .get('/reviews', ({ query, headers }: any) => {
     const u = requireUser(authUser(headers));
     if (!isStaff(u)) throw forbidden('需要管理员权限');
     const seasonId = Number(query?.seasonId ?? 0);
     const season = seasonId ? findSeason(seasonId) : activeSeason();
-    if (!season) return { ok: true, season: null, items: [], threshold: 1 };
+    if (!season) return { ok: true, season: null, items: [], threshold: REVIEW_TARGET };
     const cfg = seasonConfig(season);
-    const threshold = publishThreshold();
     const subs = listPendingSubmissions(season.id);
     const items = subs.map((sub) => {
       const reviews = listReviews(sub.id);
@@ -86,7 +81,8 @@ export const reviewRoutes = new Elysia({ prefix: '/api/staff' })
         createdAt: sub.createdAt,
         videoAvailable: Object.values(subFiles(sub)).some((f) => f.storedName),
         reviewCount: countDistinctReviewers(sub.id),
-        threshold,
+        threshold: REVIEW_TARGET,
+        snapshot: sub.valuesJson ? JSON.parse(sub.valuesJson) : null,
         myReview: myReview
           ? { values: JSON.parse(myReview.valuesJson), comment: myReview.comment }
           : null,
@@ -96,13 +92,13 @@ export const reviewRoutes = new Elysia({ prefix: '/api/staff' })
     return {
       ok: true,
       season: { id: season.id, name: season.name, status: season.status },
-      threshold,
+      threshold: REVIEW_TARGET,
       total: items.length,
       items,
     };
   })
 
-  // ---------- 提交 / 更新自己的审核（达到刊登阈值后自动刊登） ----------
+  // ---------- 提交 / 更新自己的审核（每次审核都立即聚合刊登快照；满 3 审定格出池） ----------
   .post('/reviews/:submissionId', async ({ params, headers, body }: any) => {
     const u = requireUser(authUser(headers));
     if (!isStaff(u)) throw forbidden('需要管理员权限');
@@ -137,25 +133,25 @@ export const reviewRoutes = new Elysia({ prefix: '/api/staff' })
       comment,
     });
 
-    // 达到刊登阈值时自动刊登：有效管理员≥3 需 3 人；不足 3 人则 1 人完成即通过
-    const threshold = publishThreshold();
-    const distinct = countDistinctReviewers(sub.id);
-    let publishedValues: Record<string, number> | null = null;
-    if (distinct >= threshold) {
-      try {
-        publishedValues = publishSubmission(sub.id);
-      } catch (e) {
-        if (e instanceof AggregateError) throw badRequest(`无法刊登：${e.message}`);
-        throw e;
-      }
+    // 有审核即聚合刊登；本投稿任何一份审核被提交/更新后都刷新快照
+    const reviewCount = countDistinctReviewers(sub.id);
+    let snapshot: Record<string, number> | null = null;
+    let locked = false;
+    try {
+      const r = publishSubmission(sub.id);
+      snapshot = r.values;
+      locked = r.locked;
+    } catch (e) {
+      if (e instanceof AggregateError) throw badRequest(`无法刊登：${e.message}`);
+      throw e;
     }
     return {
       ok: true,
       created,
-      reviewCount: distinct,
-      threshold,
-      published: publishedValues !== null,
-      publishedValues,
+      reviewCount,
+      threshold: REVIEW_TARGET,
+      snapshot,
+      locked, // 已满 3 审：成绩定格，从审核池移除
     };
   })
 

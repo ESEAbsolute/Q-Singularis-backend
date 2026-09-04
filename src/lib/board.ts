@@ -21,6 +21,8 @@ export interface BoardRow {
   total: number; // 精确总分
   totalDisplay: string; // 保留一位小数展示
   manual: boolean;
+  /** 该成绩经几位管理员审核（manual=0） */
+  reviewCount: number;
   /** 分项明细（raw 与 score 是否给出取决于可见性） */
   detail: BoardDetailItem[];
 }
@@ -31,6 +33,7 @@ function buildRow(
   gameId: string | null,
   total: number,
   manual: boolean,
+  reviewCount: number,
   cfg: SeasonConfig,
   rawValues: Record<string, number>,
   scores: number[],
@@ -58,6 +61,7 @@ function buildRow(
     total,
     totalDisplay: fmt1(total),
     manual,
+    reviewCount,
     detail,
   };
 }
@@ -89,6 +93,7 @@ export function buildBoard(seasonId: number, viewer: UserRow | null): BoardRow[]
       user?.gameId ?? null,
       r.total,
       r.manual,
+      r.reviewCount,
       cfg,
       r.values,
       r.scores,

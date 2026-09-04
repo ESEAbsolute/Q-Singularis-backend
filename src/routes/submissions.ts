@@ -11,6 +11,7 @@ import {
   listSubmissionsByUser,
   deleteSubmissionRow,
   listReviews,
+  countDistinctReviewers,
   attachSubmissionFile,
   recomputeComplete,
   subFiles,
@@ -77,7 +78,10 @@ export const submissionRoutes = new Elysia({ prefix: '/api' })
       ok: true,
       submissions: listSubmissionsByUser(u.qq).map((s) => {
         const season = findSeason(s.seasonId);
-        return subMeta(s, season?.name, season?.status);
+        return {
+          ...subMeta(s, season?.name, season?.status),
+          reviewCount: countDistinctReviewers(s.id),
+        };
       }),
     };
   })
@@ -243,13 +247,14 @@ export const submissionRoutes = new Elysia({ prefix: '/api' })
     } as never);
   })
 
-  // ---------- 撤销自己的投稿（上传中草稿或待审均可；打回/刊登后不可） ----------
+  // ---------- 撤销自己的投稿（上传中草稿或未刊登的待审均可；已刊登/打回后不可） ----------
   .delete('/submissions/:id', async ({ params, headers }: any) => {
     const u = requireUser(authUser(headers));
     const sub = findSubmission(Number(params.id));
     if (!sub) throw notFound('投稿不存在');
     if (sub.userQq !== u.qq) throw forbidden('只能撤销自己的投稿');
     if (sub.status !== 'pending') throw conflict('只有待审核或上传中的投稿可以被撤销');
+    if (sub.valuesJson) throw conflict('该投稿已刊登，无法撤销（如有问题请联系管理员）');
 
     const files = subFiles(sub);
     for (const f of Object.values(files)) {
