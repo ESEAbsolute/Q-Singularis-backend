@@ -340,13 +340,13 @@ export function createSubmission(params: {
 export function attachSubmissionFile(params: {
   submissionId: number;
   key: string;
-  file: { originalName: string; storedName: string; sizeBytes: number };
+  file: { originalName: string; storedName: string; sizeBytes: number; transcode?: string };
 }): { sub: SubmissionRow; previous: import('./types.js').SubFile | null } {
   const sub = findSubmission(params.submissionId);
   if (!sub) throw notFound('投稿不存在');
   const files = subFiles(sub);
   const previous = files[params.key] ?? null;
-  files[params.key] = params.file;
+  files[params.key] = params.file as import('./types.js').SubFile;
   db.prepare('UPDATE submissions SET files_json = ? WHERE id = ?').run(
     JSON.stringify(files),
     params.submissionId
@@ -365,6 +365,55 @@ export function recomputeComplete(submissionId: number): SubmissionRow {
   const complete = keys.length > 0 && keys.every((k) => files[k] !== undefined) ? 1 : 0;
   db.prepare('UPDATE submissions SET complete = ? WHERE id = ?').run(complete, submissionId);
   return findSubmission(submissionId)!;
+}
+
+// ---------------------------------------------------------------------------
+// 视频转码任务（HLS）：
+//   转码状态保存在 files_json 的每个视频条目内（transcode 字段），
+//   无独立表 —— 上传标 pending，cron 后台逐个处理；旧数据缺省视为 off（原文件）。
+// ---------------------------------------------------------------------------
+
+/** 找出下一个待转码的视频条目（complete=1 的投稿内 transcode=pending 的最老投稿） */
+export function findNextTranscodeFile(): {
+  sub: SubmissionRow;
+  key: string;
+  file: import('./types.js').SubFile;
+} | null {
+  const rows = many<SubmissionRow>(
+    `SELECT ${SUB_COLS} FROM submissions
+      WHERE complete = 1 AND status IN ('pending','published')
+        AND files_json LIKE '%"transcode":"pending"%'
+      ORDER BY id LIMIT 5`
+  );
+  for (const sub of rows) {
+    const files = subFiles(sub);
+    for (const [key, f] of Object.entries(files)) {
+      if (f?.transcode === 'pending') return { sub, key, file: f };
+    }
+  }
+  return null;
+}
+
+/** 更新某视频条目的转码状态 */
+export function setFileTranscode(params: {
+  submissionId: number;
+  key: string;
+  transcode: string;
+  error?: string | null;
+}): SubmissionRow {
+  const sub = findSubmission(params.submissionId);
+  if (!sub) throw notFound('投稿不存在');
+  const files = subFiles(sub);
+  const f = files[params.key];
+  if (!f) throw notFound('视频条目不存在');
+  f.transcode = params.transcode as import('./types.js').TranscodeState;
+  if (params.error) f.transcodeError = String(params.error).slice(0, 500);
+  else delete f.transcodeError;
+  db.prepare('UPDATE submissions SET files_json = ? WHERE id = ?').run(
+    JSON.stringify(files),
+    params.submissionId
+  );
+  return findSubmission(params.submissionId)!;
 }
 
 export function findSubmission(id: number): SubmissionRow | null {
@@ -406,6 +455,22 @@ export function listSubmissionsByUser(userQq: string): SubmissionRow[] {
   return many<SubmissionRow>(
     `SELECT ${SUB_COLS} FROM submissions WHERE user_qq = ? ORDER BY id DESC`,
     userQq
+  );
+}
+
+/** 全部视频齐全的投稿（staff 视频查看模块；可选按赛季过滤） */
+export function listCompleteSubmissions(seasonId: number | null, limit = 500): SubmissionRow[] {
+  if (seasonId) {
+    return many<SubmissionRow>(
+      `SELECT ${SUB_COLS} FROM submissions WHERE season_id = ? AND complete = 1
+         ORDER BY id DESC LIMIT ?`,
+      seasonId,
+      limit
+    );
+  }
+  return many<SubmissionRow>(
+    `SELECT ${SUB_COLS} FROM submissions WHERE complete = 1 ORDER BY id DESC LIMIT ?`,
+    limit
   );
 }
 

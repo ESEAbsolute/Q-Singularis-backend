@@ -5,6 +5,7 @@ import {
   activeSeason,
   findSubmission,
   listPendingSubmissions,
+  listCompleteSubmissions,
   upsertReview,
   listReviews,
   countDistinctReviewers,
@@ -12,11 +13,13 @@ import {
   findUserByQq,
   markRejected,
   subFiles,
+  subNotes,
 } from '../repo.js';
 import { authUser, requireUser } from '../auth.js';
 import { badRequest, notFound, forbidden, conflict } from '../lib/errors.js';
 import { AggregateError } from '../lib/aggregate.js';
 import { deleteVideoFile } from '../lib/files.js';
+import { deleteMediaAll, transcodeStatusOf } from '../lib/mediaStore.js';
 import type { UserRow, SubmissionRow, SubFiles } from '../types.js';
 
 function isStaff(u: UserRow | null): boolean {
@@ -28,12 +31,23 @@ const REVIEW_TARGET = 3;
 
 /** 文件元数据视图（key → 摘要） */
 function filesView(files: SubFiles) {
-  const out: Record<string, { originalName: string | null; sizeBytes: number; available: boolean }> = {};
+  const out: Record<
+    string,
+    {
+      originalName: string | null;
+      sizeBytes: number;
+      available: boolean;
+      transcode: string;
+      transcodeError: string | null;
+    }
+  > = {};
   for (const [key, f] of Object.entries(files)) {
     out[key] = {
       originalName: f.originalName ?? null,
       sizeBytes: f.sizeBytes ?? 0,
       available: !!f.storedName,
+      transcode: transcodeStatusOf(f),
+      transcodeError: f.transcodeError ?? null,
     };
   }
   return out;
@@ -59,6 +73,41 @@ function subMeta(sub: SubmissionRow, seasonName?: string | null) {
 }
 
 export const reviewRoutes = new Elysia({ prefix: '/api/staff' })
+  // ---------- 视频查看模块（管理员；可复查任意投稿的视频，含已发布的 7 天存档） ----------
+  .get('/media', ({ query, headers }: any) => {
+    const u = requireUser(authUser(headers));
+    if (!isStaff(u)) throw forbidden('需要管理员权限');
+    const seasonId = Number(query?.seasonId ?? 0) || null;
+    const season = seasonId ? findSeason(seasonId) : null;
+    const rows = listCompleteSubmissions(seasonId, 500);
+    const items = rows.map((sub) => {
+      const files = subFiles(sub);
+      const meta = filesView(files);
+      return {
+        id: sub.id,
+        userQq: sub.userQq,
+        gameId: findUserByQq(sub.userQq)?.gameId ?? null,
+        seasonId: sub.seasonId,
+        seasonName: findSeason(sub.seasonId)?.name ?? null,
+        status: sub.status,
+        complete: sub.complete === 1,
+        createdAt: sub.createdAt,
+        publishedAt: sub.publishedAt,
+        files: meta,
+        videoAvailable: Object.values(files).some((f) => f.storedName),
+        values: sub.valuesJson ? JSON.parse(sub.valuesJson) : null,
+      };
+    });
+    return {
+      ok: true,
+      season: season
+        ? { id: season.id, name: season.name, status: season.status }
+        : null,
+      total: items.length,
+      items,
+    };
+  })
+
   // ---------- 审核队列（管理员；展示视频齐全且未满 3 审的投稿） ----------
   .get('/reviews', ({ query, headers }: any) => {
     const u = requireUser(authUser(headers));
@@ -166,10 +215,16 @@ export const reviewRoutes = new Elysia({ prefix: '/api/staff' })
         ? String(body.reason).trim().slice(0, 500)
         : null;
 
-    // 先删除全部视频文件
+    // 先删除全部视频存储（原文件/HLS/R2）与截图文件
     const files = subFiles(sub);
     for (const f of Object.values(files)) {
-      if (f?.storedName) deleteVideoFile(sub.seasonId, f.storedName);
+      if (f?.storedName) await deleteMediaAll(sub.seasonId, f.storedName);
+    }
+    const notes = subNotes(sub);
+    for (const n of Object.values(notes)) {
+      for (const img of n?.images ?? []) {
+        if (img?.storedName) deleteVideoFile(sub.seasonId, img.storedName);
+      }
     }
     const rejected = markRejected({ submissionId: sub.id, by: u.qq, reason });
     return {

@@ -1,10 +1,11 @@
 import { db, now } from './db.js';
 import { env } from './env.js';
 import { deleteVideoFile } from './lib/files.js';
+import { deleteMediaAll } from './lib/mediaStore.js';
 import type { SubFiles, SubFile } from './types.js';
 
 /** 周期清理任务（由 index.ts 注册定时器调用） */
-export function runCleanup(): void {
+export async function runCleanup(): Promise<void> {
   const t = now();
 
   // 1) 删除超过验证时限仍未验证的账号
@@ -18,18 +19,18 @@ export function runCleanup(): void {
   // 2) 清理过期会话
   db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(t);
 
-  // 3) 审核完成(published)超过 N 天的视频：删除文件，保留记录与数据
+  // 3) 审核完成(published)超过 N 天的视频：删除存储（原文件/HLS/R2），保留记录与数据
   const keepAfter = t - env.videoKeepDays * 24 * 3600 * 1000;
   const oldPublished = db
     .prepare(
-      "SELECT id, season_id, files_json, notes_json FROM submissions WHERE status = 'published' AND published_at IS NOT NULL AND published_at < ?"
+      "SELECT id, season_id, files_json FROM submissions WHERE status = 'published' AND published_at IS NOT NULL AND published_at < ?"
     )
-    .all(keepAfter) as { id: number; season_id: number; files_json: string; notes_json: string }[];
+    .all(keepAfter) as { id: number; season_id: number; files_json: string }[];
   const upd = db.prepare("UPDATE submissions SET files_json = '{}', complete = 0 WHERE id = ?");
   for (const s of oldPublished) {
     const files = parseFiles(s.files_json);
     for (const f of Object.values(files)) {
-      if (f?.storedName) deleteVideoFile(s.season_id, f.storedName);
+      if (f?.storedName) await deleteMediaAll(s.season_id, f.storedName);
     }
     upd.run(s.id);
   }
@@ -51,7 +52,7 @@ export function runCleanup(): void {
   for (const s of rejectedRows) {
     const files = parseFiles(s.files_json);
     for (const f of Object.values(files)) {
-      if (f?.storedName) deleteVideoFile(s.season_id, f.storedName);
+      if (f?.storedName) await deleteMediaAll(s.season_id, f.storedName);
     }
     const notes = parseNotes(s.notes_json);
     for (const n of Object.values(notes)) {

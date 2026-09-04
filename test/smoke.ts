@@ -177,6 +177,12 @@ async function main() {
     !!files['damage'] && !!files['time'],
     detail.json?.submission
   );
+  check(
+    '视频条目带 transcode 状态（测试环境无 ffmpeg → off 原文件模式）',
+    detail.json?.submission?.files?.damage?.transcode === 'off' &&
+      detail.json?.submission?.files?.time?.transcode === 'off',
+    detail.json?.submission?.files
+  );
   const stream = await fetch(`${base}/api/submissions/${sid}/video/damage`, {
     headers: { authorization: `Bearer ${ownerToken}` },
   });
@@ -502,6 +508,38 @@ async function main() {
     headers: { authorization: `Bearer ${ownerToken}` },
   });
   check('定格后截图文件已删除（404）', noteGone.status === 404, noteGone.status);
+
+  console.log('== 视频查看模块（staff/media） ==');
+  const media = await api(`/api/staff/media?seasonId=${exprSeasonId}`, { token: suLogin.token });
+  const mediaIds = media.json.items?.map((x: { id: number }) => x.id) ?? [];
+  check('staff 可读取视频查看列表', media.json.ok === true, media.json);
+  const mPublished = media.json.items?.find((x: { id: number }) => x.id === sidNote);
+  check(
+    '含已刊登(3 审)投稿且视频可用',
+    mPublished && mPublished.status === 'published' && mPublished.videoAvailable === true,
+    mPublished
+  );
+  const mPending = media.json.items?.find((x: { id: number }) => x.id === sid3);
+  check(
+    '含审核中(2/3)投稿且视频可用',
+    mPending && mPending.status === 'pending' && mPending.videoAvailable === true,
+    mPending
+  );
+  check('打回稿件不出现在视频查看列表', !mediaIds.includes(sidRej), mediaIds);
+  check(
+    '视频条目带 transcode 标记（off）',
+    mPublished?.files?.T?.transcode === 'off' && mPending?.files?.T?.transcode === 'off',
+    mPending?.files
+  );
+  // 未转码时 /video/:key 仍可直读（原文件模式）
+  const mediaStream = await fetch(`${base}/api/submissions/${sid3}/video/T`, {
+    headers: { authorization: `Bearer ${suLogin.token}` },
+  });
+  check('原文件模式视频可读取', mediaStream.status === 200, mediaStream.status);
+  const m3u8 = await fetch(`${base}/api/submissions/${sid3}/video/T/index.m3u8`, {
+    headers: { authorization: `Bearer ${suLogin.token}` },
+  });
+  check('未转码时 HLS 播放列表返回 404', m3u8.status === 404, m3u8.status);
 
   console.log(`\n结果: ${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);

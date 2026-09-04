@@ -56,5 +56,21 @@ export const env = {
   videoKeepDays: num('VIDEO_KEEP_DAYS', 7),
   maxUploadBytes: num('MAX_UPLOAD_BYTES', 100 * 1024 * 1024),
   noteImageMaxBytes: num('MAX_NOTE_IMAGE_BYTES', 10 * 1024 * 1024),
+  // ---- 转码 / HLS（服务器需装 ffmpeg；auto = 探测不到则退避为原文件直传模式）----
+  transcodeEnabled: (process.env.TRANSCODE_ENABLED ?? 'auto').toLowerCase(),
+  ffmpegPath: process.env.FFMPEG_PATH ?? 'ffmpeg',
+  ffprobePath: process.env.FFPROBE_PATH ?? 'ffprobe',
+  transcodeEncoder: process.env.TRANSCODE_ENCODER ?? 'libx265',
+  transcodeCrf: num('TRANSCODE_CRF', 26),
+  transcodePreset: process.env.TRANSCODE_PRESET ?? 'medium',
+  hlsSegmentSeconds: num('HLS_SEGMENT_SECONDS', 6),
+  // ---- 媒体存储：local（默认）| r2（Cloudflare R2，S3 兼容）----
+  storage: (process.env.STORAGE ?? 'local').toLowerCase() === 'r2' ? ('r2' as const) : ('local' as const),
+  r2: {
+    endpoint: process.env.R2_ENDPOINT ?? '',
+    accessKeyId: process.env.R2_ACCESS_KEY_ID ?? '',
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY ?? '',
+    bucket: process.env.R2_BUCKET ?? '',
+  },
   sessionTtlMs: num('SESSION_TTL_MS', 30 * 24 * 3600 * 1000),
 };

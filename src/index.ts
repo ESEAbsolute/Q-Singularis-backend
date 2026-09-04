@@ -2,6 +2,7 @@ import { Elysia } from 'elysia';
 import { node } from '@elysia/node';
 import { env } from './env.js';
 import { runCleanup } from './cron.js';
+import { runTranscodeTick } from './transcodeWorker.js';
 import { HttpError } from './lib/errors.js';
 import { authRoutes, meRoutes } from './routes/auth.js';
 import { seasonRoutes, staffSeasonRoutes, suSeasonRoutes } from './routes/seasons.js';
@@ -91,12 +92,13 @@ const app = new Elysia({ adapter: node() })
 
 // 周期任务：清理未验证账号 / 过期会话 / 过期视频文件
 setInterval(() => {
-  try {
-    runCleanup();
-  } catch (e) {
-    console.error('[cleanup error]', e);
-  }
+  runCleanup().catch((e) => console.error('[cleanup error]', e));
 }, 60_000);
+
+// 周期任务：后台视频转码（压制 + HLS 切片），单实例执行
+setInterval(() => {
+  runTranscodeTick().catch((e) => console.error('[transcode error]', e));
+}, 10_000);
 
 app.listen({ port: env.port, hostname: env.host }, () => {
   console.log(`Q-Singularis backend listening on http://${env.host}:${env.port}`);

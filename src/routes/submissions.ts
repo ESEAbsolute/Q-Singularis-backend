@@ -36,6 +36,13 @@ import {
   videoSizeBytes,
   deleteVideoFile,
 } from '../lib/files.js';
+import { ffmpegAvailable } from '../lib/ffmpeg.js';
+import {
+  transcodeStatusOf,
+  readHlsPlaylist,
+  readHlsSegment,
+  deleteMediaAll,
+} from '../lib/mediaStore.js';
 import type { UserRow, SubmissionRow, SubFiles, SubFile } from '../types.js';
 import { readFileSync, createReadStream } from 'node:fs';
 import { join } from 'node:path';
@@ -45,14 +52,41 @@ function isStaff(u: UserRow | null): boolean {
   return !!u && (u.role === 'admin' || u.role === 'su');
 }
 
+/** 校验视频访问权限并定位条目（:key 支持旧数据 "*" 回退） */
+function authVideoFile(params: any, headers: any): { sub: SubmissionRow; file: SubFile } {
+  const u = requireUser(authUser(headers));
+  const sub = findSubmission(Number(params.id));
+  if (!sub) throw notFound('投稿不存在');
+  const isOwner = sub.userQq === u.qq;
+  if (!isOwner && !isStaff(u)) throw forbidden('无权查看该视频');
+  const files = subFiles(sub);
+  const key = String(params.key ?? '');
+  let file: SubFile | undefined = files[key];
+  // 旧版单视频数据存于 "*"：未按项匹配时回退到它
+  if (!file && files['*'] && Object.keys(files).length === 1) file = files['*'];
+  if (!file) throw notFound('该测试项没有对应视频');
+  if (!file.storedName) throw notFound('视频文件不存在');
+  return { sub, file };
+}
+
 function fileMeta(files: SubFiles) {
-  const out: Record<string, { originalName: string | null; sizeBytes: number; available: boolean }> =
-    {};
+  const out: Record<
+    string,
+    {
+      originalName: string | null;
+      sizeBytes: number;
+      available: boolean;
+      transcode: string;
+      transcodeError: string | null;
+    }
+  > = {};
   for (const [key, f] of Object.entries(files)) {
     out[key] = {
       originalName: f.originalName ?? null,
       sizeBytes: f.sizeBytes ?? 0,
       available: !!f.storedName,
+      transcode: transcodeStatusOf(f),
+      transcodeError: f.transcodeError ?? null,
     };
   }
   return out;
@@ -165,7 +199,13 @@ export const submissionRoutes = new Elysia({ prefix: '/api' })
     const { previous } = attachSubmissionFile({
       submissionId: sub.id,
       key,
-      file: { originalName, storedName, sizeBytes: bytes.byteLength },
+      file: {
+        originalName,
+        storedName,
+        sizeBytes: bytes.byteLength,
+        // ffmpeg 可用则标记待转码（后台压制 + HLS）；否则原文件模式
+        transcode: ffmpegAvailable() ? 'pending' : 'off',
+      },
     });
     // 若该 key 之前有旧文件（替换重传），删除之
     if (previous) deleteVideoFile(season.id, previous.storedName);
@@ -218,21 +258,41 @@ export const submissionRoutes = new Elysia({ prefix: '/api' })
     };
   })
 
-  // ---------- 视频文件（本人 / 管理员；Range 支持；:key = raw 项 key 或 *） ----------
-  .get('/submissions/:id/video/:key', async ({ params, headers, request }: any) => {
-    const u = requireUser(authUser(headers));
-    const sub = findSubmission(Number(params.id));
-    if (!sub) throw notFound('投稿不存在');
-    const isOwner = sub.userQq === u.qq;
-    if (!isOwner && !isStaff(u)) throw forbidden('无权查看该视频');
+  // ---------- 视频文件（本人 / 管理员） ----------
+  // 转码完成后：/video/:key/index.m3u8 为 HLS 播放列表，/video/:key/seg_*.ts 为切片
+  // 原文件模式（off/failed/pending 或历史数据）：/video/:key 直出原文件（Range 支持）
+  .get('/submissions/:id/video/:key/index.m3u8', async ({ params, headers }: any) => {
+    const { sub, file } = authVideoFile(params, headers);
+    if (transcodeStatusOf(file) !== 'done') throw notFound('该视频尚未完成转码');
+    const data = await readHlsPlaylist(sub.seasonId, file.storedName);
+    if (!data) throw notFound('视频文件不存在');
+    return new Response(data, {
+      headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
+    } as never);
+  })
 
-    const files = subFiles(sub);
-    const key = String(params.key ?? '');
-    let file: SubFile | undefined = files[key];
-    // 旧版单视频数据存于 "*"：未按项匹配时回退到它
-    if (!file && files['*'] && Object.keys(files).length === 1) file = files['*'];
-    if (!file) throw notFound('该测试项没有对应视频');
-    if (!file.storedName) throw notFound('视频文件不存在');
+  .get('/submissions/:id/video/:key/:segName', async ({ params, headers }: any) => {
+    const segName = String(params.segName ?? '');
+    // 白名单：ffmpeg 生成形如 seg_00000.ts 的切片名，杜绝路径穿越
+    if (!/^seg_\d{5}\.ts$/.test(segName)) throw notFound('片段不存在');
+    const { sub, file } = authVideoFile(params, headers);
+    if (transcodeStatusOf(file) !== 'done') throw notFound('该视频尚未完成转码');
+    const data = await readHlsSegment(sub.seasonId, file.storedName, segName);
+    if (!data) throw notFound('片段不存在');
+    return new Response(data, {
+      headers: { 'Content-Type': 'video/mp2t' },
+    } as never);
+  })
+
+  .get('/submissions/:id/video/:key', async ({ params, headers, request }: any) => {
+    const { sub, file } = authVideoFile(params, headers);
+    if (transcodeStatusOf(file) === 'done') {
+      // 旧客户端访问原文件路径：301 到 HLS 播放列表
+      return Response.redirect(
+        `/api/submissions/${sub.id}/video/${encodeURIComponent(String(params.key))}/index.m3u8`,
+        301
+      );
+    }
     if (!videoExists(sub.seasonId, file.storedName)) throw notFound('视频文件不存在');
 
     const size = videoSizeBytes(sub.seasonId, file.storedName)!;
@@ -286,7 +346,7 @@ export const submissionRoutes = new Elysia({ prefix: '/api' })
     purgeSubmissionNoteImages(sub); // 提交说明的截图文件一并删除
     const files = subFiles(sub);
     for (const f of Object.values(files)) {
-      if (f?.storedName) deleteVideoFile(sub.seasonId, f.storedName);
+      if (f?.storedName) await deleteMediaAll(sub.seasonId, f.storedName);
     }
     deleteSubmissionRow(sub.id);
     return { ok: true };

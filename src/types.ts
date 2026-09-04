@@ -11,11 +11,18 @@ export type SeasonStatus = (typeof SEASON_STATUS)[number];
 export const SUB_STATUS = ['pending', 'published', 'replaced', 'rejected'] as const;
 export type SubStatus = (typeof SUB_STATUS)[number];
 
+/** 视频媒体的转码状态：pending=待压制 processing=压制中 done=已转 HLS failed=压制失败 off=原文件模式 */
+export type TranscodeState = 'pending' | 'processing' | 'done' | 'failed' | 'off';
+
 /** submission 中的一个文件（视频或截图） */
 export interface SubFile {
   originalName: string | null;
   storedName: string;
   sizeBytes: number;
+  /** 视频条目：转码状态（截图无此字段）；旧数据缺省视为 off（原文件） */
+  transcode?: TranscodeState;
+  /** 转码失败原因（仅 failed 时） */
+  transcodeError?: string | null;
 }
 
 /** files_json：rawKey → 视频文件；旧版迁移数据使用 "*" key */
