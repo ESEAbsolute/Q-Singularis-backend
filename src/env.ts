@@ -54,6 +54,6 @@ export const env = {
   botSecret: process.env.BOT_SECRET ?? 'change-me-bot-secret',
   verifyTtlMs: num('VERIFY_TTL_MS', 10 * 60 * 1000),
   videoKeepDays: num('VIDEO_KEEP_DAYS', 7),
-  maxUploadBytes: num('MAX_UPLOAD_BYTES', 50 * 1024 * 1024),
+  maxUploadBytes: num('MAX_UPLOAD_BYTES', 100 * 1024 * 1024),
   sessionTtlMs: num('SESSION_TTL_MS', 30 * 24 * 3600 * 1000),
 };
