@@ -84,7 +84,7 @@ export const reviewRoutes = new Elysia({ prefix: '/api/staff' })
         threshold: REVIEW_TARGET,
         snapshot: sub.valuesJson ? JSON.parse(sub.valuesJson) : null,
         myReview: myReview
-          ? { values: JSON.parse(myReview.valuesJson), comment: myReview.comment }
+          ? { values: JSON.parse(myReview.valuesJson) }
           : null,
         items: cfg.items,
       };
@@ -124,13 +124,10 @@ export const reviewRoutes = new Elysia({ prefix: '/api/staff' })
       values[item.key] = n;
     }
 
-    const comment = typeof body?.comment === 'string' && body.comment ? String(body.comment) : null;
-
     const { created } = upsertReview({
       submissionId: sub.id,
       reviewerQq: u.qq,
       values,
-      comment,
     });
 
     // 有审核即聚合刊登；本投稿任何一份审核被提交/更新后都刷新快照

@@ -14,14 +14,29 @@ const ALLOWED_EXT = [
   '.mp4', '.webm', '.mov', '.m4v', '.mkv', '.avi', '.flv', '.wmv', '.ts', '.mpg', '.mpeg',
 ];
 
+/** 提交截图允许的扩展名（与 MIME 白名单对应） */
+const ALLOWED_IMG_EXT = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
+
 export function sanitizeExt(originalName: string): string {
   const ext = extname(originalName).toLowerCase();
   return ALLOWED_EXT.includes(ext) ? ext : '.mp4';
 }
 
+/** 截图扩展名校验；非图片扩展返回 null */
+export function imageExtOf(originalName: string): string | null {
+  const ext = extname(originalName).toLowerCase();
+  return ALLOWED_IMG_EXT.includes(ext) ? ext : null;
+}
+
 /** 生成新存储文件名（不落盘） */
 export function genStoredName(originalName: string): string {
   return `${Date.now()}-${randomBytes(6).toString('hex')}${sanitizeExt(originalName)}`;
+}
+
+/** 生成截图存储文件名（不落盘）；非图片名默认 .png */
+export function genImageStoredName(originalName: string): string {
+  const ext = imageExtOf(originalName) ?? '.png';
+  return `${Date.now()}-${randomBytes(6).toString('hex')}${ext}`;
 }
 
 /** 实际存储路径 */
@@ -83,6 +98,19 @@ export function videoContentType(storedName: string): string {
     '.ts': 'video/mp2t',
     '.mpg': 'video/mpeg',
     '.mpeg': 'video/mpeg',
+  };
+  const ext = extname(storedName).toLowerCase();
+  return map[ext] ?? 'application/octet-stream';
+}
+
+/** 截图 Content-Type */
+export function imageContentType(storedName: string): string {
+  const map: Record<string, string> = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
   };
   const ext = extname(storedName).toLowerCase();
   return map[ext] ?? 'application/octet-stream';

@@ -31,6 +31,7 @@ CREATE TABLE submissions (
   files_json    TEXT NOT NULL DEFAULT '{}',
   complete      INTEGER NOT NULL DEFAULT 0,
   values_json   TEXT,          -- 刊登后聚合的 raw 值 {key:number}
+  notes_json    TEXT NOT NULL DEFAULT '{}',  -- 玩家提交说明 {key: {text, images[]}}（图片审核完成后即删）
   created_at    INTEGER NOT NULL,
   published_at  INTEGER,
   rejected_at   INTEGER,
@@ -99,6 +100,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   files_json    TEXT NOT NULL DEFAULT '{}',
   complete      INTEGER NOT NULL DEFAULT 0,
   values_json   TEXT,
+  notes_json    TEXT NOT NULL DEFAULT '{}',
   created_at    INTEGER NOT NULL,
   published_at  INTEGER,
   rejected_at   INTEGER,
@@ -170,6 +172,24 @@ function migrateSubmissionsV1(): void {
 }
 
 migrateSubmissionsV1();
+
+/**
+ * v2.x 老库补列：submissions 缺 notes_json（玩家提交说明/截图）时 ALTER 追加。
+ */
+function migrateAddNotesColumn(): void {
+  const hasTable = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='submissions'")
+    .get();
+  if (!hasTable) return;
+  const cols = new Set(
+    (db.prepare('PRAGMA table_info(submissions)').all() as { name: string }[]).map((c) => c.name)
+  );
+  if (cols.has('notes_json')) return;
+  console.log('[db] 检测到 submissions 缺少 notes_json，正在补充列…');
+  db.exec("ALTER TABLE submissions ADD COLUMN notes_json TEXT NOT NULL DEFAULT '{}';");
+}
+
+migrateAddNotesColumn();
 
 // ---------------------------------------------------------------------------
 // 种子赛季：若没有任何赛季，创建「第 0 期」演示配置

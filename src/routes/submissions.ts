@@ -15,15 +15,24 @@ import {
   attachSubmissionFile,
   recomputeComplete,
   subFiles,
+  subNotes,
+  setSubmissionNoteText,
+  addSubmissionNoteImage,
+  deleteSubmissionNoteImage,
+  purgeSubmissionNoteImages,
 } from '../repo.js';
 import { authUser, requireUser } from '../auth.js';
 import { badRequest, notFound, forbidden, conflict } from '../lib/errors.js';
 import { env } from '../env.js';
 import {
   genStoredName,
+  genImageStoredName,
+  imageExtOf,
   writeVideoFile,
+  readVideoBuffer,
   videoExists,
   videoContentType,
+  imageContentType,
   videoSizeBytes,
   deleteVideoFile,
 } from '../lib/files.js';
@@ -49,6 +58,25 @@ function fileMeta(files: SubFiles) {
   return out;
 }
 
+/** notes 视图：文本 + 截图元数据（截图的 storedName 不暴露，读取走鉴权接口） */
+function notesView(sub: SubmissionRow) {
+  const notes = subNotes(sub);
+  const out: Record<
+    string,
+    { text: string; images: { originalName: string | null; sizeBytes: number }[] }
+  > = {};
+  for (const [key, n] of Object.entries(notes)) {
+    out[key] = {
+      text: n?.text ?? '',
+      images: (n?.images ?? []).map((f) => ({
+        originalName: f.originalName ?? null,
+        sizeBytes: f.sizeBytes ?? 0,
+      })),
+    };
+  }
+  return out;
+}
+
 function subMeta(sub: SubmissionRow, seasonName?: string | null, seasonStatus?: string | null) {
   const files = subFiles(sub);
   return {
@@ -60,6 +88,7 @@ function subMeta(sub: SubmissionRow, seasonName?: string | null, seasonStatus?: 
     complete: sub.complete === 1,
     files: fileMeta(files),
     videoAvailable: Object.values(files).some((f) => f.storedName),
+    notes: notesView(sub),
     values: sub.valuesJson ? JSON.parse(sub.valuesJson) : null,
     createdAt: sub.createdAt,
     publishedAt: sub.publishedAt,
@@ -176,7 +205,6 @@ export const submissionRoutes = new Elysia({ prefix: '/api' })
       reviewerQq: r.reviewerQq,
       reviewerName: findUserByQq(r.reviewerQq)?.gameId ?? r.reviewerQq,
       values: JSON.parse(r.valuesJson),
-      comment: r.comment,
       updatedAt: r.updatedAt,
     }));
     return {
@@ -255,11 +283,126 @@ export const submissionRoutes = new Elysia({ prefix: '/api' })
     if (sub.userQq !== u.qq) throw forbidden('只能撤销自己的投稿');
     if (sub.status !== 'pending') throw conflict('只有待审核或上传中的投稿可以被撤销');
     if (sub.valuesJson) throw conflict('该投稿已刊登，无法撤销（如有问题请联系管理员）');
-
+    purgeSubmissionNoteImages(sub); // 提交说明的截图文件一并删除
     const files = subFiles(sub);
     for (const f of Object.values(files)) {
       if (f?.storedName) deleteVideoFile(sub.seasonId, f.storedName);
     }
     deleteSubmissionRow(sub.id);
     return { ok: true };
+  })
+
+  // ---------- 提交说明：文本（每 raw 项一条，可选） ----------
+  // 仅本人、进行中投稿（0 审，含视频未传齐的草稿）；开始审核后锁定不可改
+  .post('/submissions/note-text', async ({ headers, body, query }: any) => {
+    const u = requireUser(authUser(headers));
+    if (u.status !== 'verified') throw forbidden('请先完成 QQ 验证');
+    const season = activeSeason();
+    if (!season) throw conflict('当前没有进行中的赛季，无法填写提交说明');
+    const cfg = seasonConfig(season);
+    const key = String(query?.key ?? '');
+    if (!cfg.items.some((i) => i.key === key)) {
+      throw badRequest(`未知测试项 "${key}"`);
+    }
+    let sub = findAnyPendingSubmission(season.id, u.qq);
+    if (!sub) sub = createSubmission({ seasonId: season.id, userQq: u.qq });
+    const text =
+      typeof body?.text === 'string' ? String(body.text).slice(0, 500).trim() : '';
+    const updated = setSubmissionNoteText(sub.id, key, text);
+    return {
+      ok: true,
+      submission: subMeta(updated, season.name, season.status),
+      note: { key, text },
+    };
+  })
+
+  // ---------- 提交说明：截图（每 raw 项最多 9 张，每张 ≤ MAX_NOTE_IMAGE_BYTES） ----------
+  .post('/submissions/note-images', async ({ headers, query, request }: any) => {
+    const u = requireUser(authUser(headers));
+    if (u.status !== 'verified') throw forbidden('请先完成 QQ 验证');
+    const season = activeSeason();
+    if (!season) throw conflict('当前没有进行中的赛季，无法添加截图');
+    const cfg = seasonConfig(season);
+    const key = String(query?.key ?? '');
+    if (!cfg.items.some((i) => i.key === key)) {
+      throw badRequest(`未知测试项 "${key}"`);
+    }
+    let sub = findAnyPendingSubmission(season.id, u.qq);
+    if (!sub) sub = createSubmission({ seasonId: season.id, userQq: u.qq });
+
+    let rawName = String(
+      headers['x-filename'] ?? headers['X-Filename'] ?? headers['x-file-name'] ?? 'shot.png'
+    );
+    try {
+      rawName = decodeURIComponent(rawName);
+    } catch {
+      /* keep as-is */
+    }
+    const originalName =
+      rawName.split('\\').pop()!.split('/').pop()!.slice(0, 200) || 'shot.png';
+    if (!imageExtOf(originalName)) {
+      throw badRequest('仅支持 png / jpg / jpeg / webp / gif 图片');
+    }
+
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.byteLength === 0) throw badRequest('图片内容为空');
+    if (bytes.byteLength > env.noteImageMaxBytes) {
+      throw badRequest(
+        `单张截图不能超过 ${Math.floor(env.noteImageMaxBytes / 1024 / 1024)}MB`
+      );
+    }
+    const notes = subNotes(sub);
+    const count = notes[key]?.images?.length ?? 0;
+    if (count >= 9) throw badRequest('每个测试项的截图最多 9 张');
+
+    const storedName = genImageStoredName(originalName);
+    writeVideoFile(sub.seasonId, storedName, bytes);
+    const updated = addSubmissionNoteImage(sub.id, key, {
+      originalName,
+      storedName,
+      sizeBytes: bytes.byteLength,
+    });
+    return {
+      ok: true,
+      submission: subMeta(updated, season.name, season.status),
+    };
+  })
+
+  // ---------- 提交说明：查看截图（本人 / 管理员） ----------
+  .get('/submissions/:id/note-images/:key/:index', ({ params, headers }: any) => {
+    const u = requireUser(authUser(headers));
+    const sub = findSubmission(Number(params.id));
+    if (!sub) throw notFound('投稿不存在');
+    const isOwner = sub.userQq === u.qq;
+    if (!isOwner && !isStaff(u)) throw forbidden('无权查看该投稿');
+
+    const key = String(params.key ?? '');
+    const index = Number(params.index);
+    const note = subNotes(sub)[key];
+    const img = note?.images?.[index];
+    if (!img?.storedName) throw notFound('截图不存在');
+    const data = readVideoBuffer(sub.seasonId, img.storedName);
+    if (!data) throw notFound('截图文件不存在');
+    return new Response(data, {
+      headers: { 'Content-Type': imageContentType(img.storedName) },
+    } as never);
+  })
+
+  // ---------- 提交说明：删除一张截图（仅本人，审核开始前） ----------
+  .delete('/submissions/:id/note-images', ({ params, headers, query }: any) => {
+    const u = requireUser(authUser(headers));
+    const sub = findSubmission(Number(params.id));
+    if (!sub) throw notFound('投稿不存在');
+    if (sub.userQq !== u.qq) throw forbidden('只能删除自己投稿的截图');
+    if (sub.status !== 'pending') throw conflict('该投稿已不在审核流程中，无法修改');
+    if (sub.valuesJson || countDistinctReviewers(sub.id) > 0) {
+      throw conflict('投稿已开始审核，提交说明已锁定（如需修改请联系管理员）');
+    }
+    const key = String(query?.key ?? '');
+    const index = Number(query?.index);
+    const note = subNotes(sub)[key];
+    const img = note?.images?.[index];
+    if (!img?.storedName) throw notFound('截图不存在');
+    const updated = deleteSubmissionNoteImage(sub.id, key, img.storedName);
+    return { ok: true, submission: subMeta(updated) };
   });

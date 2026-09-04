@@ -11,7 +11,7 @@ export type SeasonStatus = (typeof SEASON_STATUS)[number];
 export const SUB_STATUS = ['pending', 'published', 'replaced', 'rejected'] as const;
 export type SubStatus = (typeof SUB_STATUS)[number];
 
-/** submission 中的一个视频文件 */
+/** submission 中的一个文件（视频或截图） */
 export interface SubFile {
   originalName: string | null;
   storedName: string;
@@ -20,6 +20,15 @@ export interface SubFile {
 
 /** files_json：rawKey → 视频文件；旧版迁移数据使用 "*" key */
 export type SubFiles = Record<string, SubFile>;
+
+/** 玩家对一个 raw 项的提交说明：一段文字 + 若干截图 */
+export interface SubNote {
+  text: string;
+  images: SubFile[];
+}
+
+/** notes_json：rawKey → 提交说明 */
+export type SubNotes = Record<string, SubNote>;
 
 /** 一个 raw data 字段定义（本期两个：伤害量、耗时） */
 export interface RawItemDef {
@@ -72,7 +81,8 @@ export interface SubmissionRow {
   status: SubStatus;
   complete: number; // 0/1：全部 raw 项的视频是否已传齐
   filesJson: string | null; // {"rawKey": {originalName,storedName,sizeBytes}}
-  valuesJson: string | null; // 发布后聚合的 raw 值 {key: number}
+  valuesJson: string | null; // 审核聚合快照 {key: number}（≥1 审写入，满 3 审定格）
+  notesJson: string | null; // {"rawKey": {text, images[]}}
   createdAt: number;
   publishedAt: number | null;
   rejectedAt: number | null;

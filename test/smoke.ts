@@ -365,6 +365,13 @@ async function main() {
   const upT2 = await uploadVideo(ownerToken, 'T', new TextEncoder().encode('cheat-video'), 'cheat.mp4');
   const sidRej = upT2.json.submission?.id;
   check('第 3 期再次上传成功', !!sidRej, upT2.json);
+  // 作弊稿也带截图，验证打回时截图一并清除
+  await api('/api/submissions/note-images?key=T', {
+    method: 'POST',
+    token: ownerToken,
+    raw: new Blob([new TextEncoder().encode('fake-png-bytes-002')]),
+    headers: { 'x-filename': encodeURIComponent('作弊截图.png') },
+  });
   const rejectRes = await api(`/api/staff/submissions/${sidRej}/reject`, {
     method: 'POST',
     token: suLogin.token,
@@ -379,9 +386,122 @@ async function main() {
     rej && rej.status === 'rejected' && String(rej.rejectReason).includes('作弊'),
     rej
   );
+  check('打回后截图已清除', rej && rej.notes?.T?.images?.length === 0, rej?.notes);
   // 打回后（文件已删）可再次上传新视频
   const upT3 = await uploadVideo(ownerToken, 'T', new TextEncoder().encode('again-video'), 'again.mp4');
   check('打回后可以重新上传', upT3.json.complete === true, upT3.json);
+
+  console.log('== 提交说明（可选文本 + 截图，仅审核员可见） ==');
+  const sidNote = upT3.json.submission?.id;
+
+  const noteText = await api('/api/submissions/note-text?key=T', {
+    method: 'POST',
+    token: ownerToken,
+    body: { text: '测试说明：连续三刀命中，无剪辑' },
+  });
+  check('填写提交说明文本', noteText.json.ok === true && noteText.json.note?.text === '测试说明：连续三刀命中，无剪辑', noteText.json);
+
+  const fakePng = new TextEncoder().encode('fake-png-bytes-001');
+  const img1 = await api('/api/submissions/note-images?key=T', {
+    method: 'POST',
+    token: ownerToken,
+    raw: new Blob([fakePng]),
+    headers: { 'x-filename': encodeURIComponent('战斗截图1.png') },
+  });
+  check('上传提交截图（1 张）', img1.json.ok === true && img1.json.submission?.notes?.T?.images?.length === 1, img1.json);
+
+  const badImg = await api('/api/submissions/note-images?key=T', {
+    method: 'POST',
+    token: ownerToken,
+    raw: new Blob([fakePng]),
+    headers: { 'x-filename': encodeURIComponent('evil.exe') },
+  });
+  check('非图片扩展名被拒', badImg.status === 400, badImg.json);
+
+  const mineNote = await api('/api/submissions/mine', { token: ownerToken });
+  const noteSub = mineNote.json.submissions?.find((s: { id: number }) => s.id === sidNote);
+  check(
+    'mine 返回提交说明（文本+截图摘要）',
+    noteSub?.notes?.T?.text?.includes('三刀') && noteSub?.notes?.T?.images?.length === 1,
+    noteSub?.notes
+  );
+
+  // 查看截图：本人 / 管理员
+  const noteGetOwner = await fetch(`${base}/api/submissions/${sidNote}/note-images/T/0`, {
+    headers: { authorization: `Bearer ${ownerToken}` },
+  });
+  check(
+    '本人可查看截图',
+    noteGetOwner.status === 200 && (noteGetOwner.headers.get('content-type') ?? '').includes('image/png'),
+    noteGetOwner.status
+  );
+  const noteGetStaff = await fetch(`${base}/api/submissions/${sidNote}/note-images/T/0`, {
+    headers: { authorization: `Bearer ${suLogin.token}` },
+  });
+  check('管理员可查看截图', noteGetStaff.status === 200, noteGetStaff.status);
+
+  // 审核开始前可删除截图
+  const delImg = await api(`/api/submissions/${sidNote}/note-images?key=T&index=0`, {
+    method: 'DELETE',
+    token: ownerToken,
+  });
+  check('审核前可删除截图', delImg.json.ok === true && delImg.json.submission?.notes?.T?.images?.length === 0, delImg.json);
+  const img2 = await api('/api/submissions/note-images?key=T', {
+    method: 'POST',
+    token: ownerToken,
+    raw: new Blob([fakePng]),
+    headers: { 'x-filename': encodeURIComponent('战斗截图2.png') },
+  });
+  check('重新上传截图', img2.json.submission?.notes?.T?.images?.length === 1, img2.json);
+
+  // 开始审核后：说明锁定（截图不可删），成绩不足 3 审仍刊登
+  const revN1 = await api(`/api/staff/reviews/${sidNote}`, {
+    method: 'POST',
+    token: suLogin.token,
+    body: { values: { T: 60 } },
+  });
+  check('投稿进入审核（1/3）', revN1.json.reviewCount === 1 && revN1.json.locked === false, revN1.json);
+  const delLocked = await api(`/api/submissions/${sidNote}/note-images?key=T&index=0`, {
+    method: 'DELETE',
+    token: ownerToken,
+  });
+  check('审核开始后截图锁定不可删', delLocked.status === 409, delLocked.json);
+
+  // 满 3 审后：截图即时删除、文本保留
+  const restoreB = await api('/internal/bot/fcadmin', {
+    method: 'POST',
+    headers: { 'x-bot-secret': secret },
+    body: { operator: adminA, qq: adminB },
+  });
+  check('恢复 adminB 管理员资格', restoreB.json.ok === true, restoreB.json);
+  const revN2 = await api(`/api/staff/reviews/${sidNote}`, {
+    method: 'POST',
+    token: adminBUser.token,
+    body: { values: { T: 62 } },
+  });
+  check('第 2 审（2/3）', revN2.json.reviewCount === 2 && revN2.json.locked === false, revN2.json);
+  const revN3 = await api(`/api/staff/reviews/${sidNote}`, {
+    method: 'POST',
+    token: adminDUser.token,
+    body: { values: { T: 61 } },
+  });
+  check(
+    '第 3 审后定格（三值不同取最接近平均向下取整：60,61,62 等距 → 60）',
+    revN3.json.locked === true && revN3.json.snapshot?.T === 60,
+    revN3.json
+  );
+
+  const noteAfterPub = await api(`/api/submissions/${sidNote}`, { token: ownerToken });
+  const noteAfter = noteAfterPub.json?.submission?.notes?.T;
+  check(
+    '定格后截图已删除、文本保留',
+    noteAfter && noteAfter.images?.length === 0 && noteAfter.text?.includes('三刀'),
+    noteAfter
+  );
+  const noteGone = await fetch(`${base}/api/submissions/${sidNote}/note-images/T/0`, {
+    headers: { authorization: `Bearer ${ownerToken}` },
+  });
+  check('定格后截图文件已删除（404）', noteGone.status === 404, noteGone.status);
 
   console.log(`\n结果: ${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);

@@ -10,6 +10,7 @@ import type {
 import { computeScores, fmt1, round1 } from './lib/scoring.js';
 import { aggregateReviews, AggregateError } from './lib/aggregate.js';
 import { notFound, forbidden, conflict } from './lib/errors.js';
+import { deleteVideoFile } from './lib/files.js';
 import { env } from './env.js';
 import { hashPassword, randomToken, randomUuid } from './lib/crypto.js';
 
@@ -20,7 +21,7 @@ const USER_COLS =
   'qq, password_hash AS passwordHash, role, status, game_id AS gameId, auth_uuid AS authUuid, created_at AS createdAt, verified_at AS verifiedAt';
 const SEASON_COLS = 'id, name, status, config, created_at AS createdAt, archived_at AS archivedAt';
 const SUB_COLS =
-  'id, season_id AS seasonId, user_qq AS userQq, status, files_json AS filesJson, complete, values_json AS valuesJson, created_at AS createdAt, published_at AS publishedAt, rejected_at AS rejectedAt, rejected_by AS rejectedBy, reject_reason AS rejectReason';
+  'id, season_id AS seasonId, user_qq AS userQq, status, files_json AS filesJson, complete, values_json AS valuesJson, notes_json AS notesJson, created_at AS createdAt, published_at AS publishedAt, rejected_at AS rejectedAt, rejected_by AS rejectedBy, reject_reason AS rejectReason';
 const REVIEW_COLS =
   'id, submission_id AS submissionId, reviewer_qq AS reviewerQq, values_json AS valuesJson, comment, created_at AS createdAt, updated_at AS updatedAt';
 const MANUAL_COLS =
@@ -232,6 +233,92 @@ export function subFiles(sub: SubmissionRow): import('./types.js').SubFiles {
   }
 }
 
+// ---------------------------------------------------------------------------
+// notes（玩家提交说明：文本 + 截图，供审核员参考）
+//   notesJson: { "<rawKey>": { text: string, images: SubFile[] } }
+// 图片文件与视频同存 uploads/<seasonId>/；图片在审核完成（定格/打回/撤销）后即时删除，
+// 未完成审核期间一直保留。
+// ---------------------------------------------------------------------------
+
+/** 读取 submission 的提交说明映射 */
+export function subNotes(sub: SubmissionRow): import('./types.js').SubNotes {
+  try {
+    return sub.notesJson ? (JSON.parse(sub.notesJson) as import('./types.js').SubNotes) : {};
+  } catch {
+    return {};
+  }
+}
+
+function updateNotes(submissionId: number, notes: import('./types.js').SubNotes): void {
+  db.prepare('UPDATE submissions SET notes_json = ? WHERE id = ?').run(
+    JSON.stringify(notes),
+    submissionId
+  );
+}
+
+/** 写某 raw 项的说明文本（空串 = 清除） */
+export function setSubmissionNoteText(
+  submissionId: number,
+  key: string,
+  text: string
+): SubmissionRow {
+  const sub = findSubmission(submissionId);
+  if (!sub) throw notFound('投稿不存在');
+  const notes = subNotes(sub);
+  const note = notes[key] ?? { text: '', images: [] };
+  note.text = text;
+  notes[key] = note;
+  updateNotes(sub.id, notes);
+  return findSubmission(sub.id)!;
+}
+
+/** 追加一张截图（上限由路由层校验） */
+export function addSubmissionNoteImage(
+  submissionId: number,
+  key: string,
+  file: { originalName: string; storedName: string; sizeBytes: number }
+): SubmissionRow {
+  const sub = findSubmission(submissionId);
+  if (!sub) throw notFound('投稿不存在');
+  const notes = subNotes(sub);
+  const note = notes[key] ?? { text: '', images: [] };
+  note.images.push(file);
+  notes[key] = note;
+  updateNotes(sub.id, notes);
+  return findSubmission(sub.id)!;
+}
+
+/** 删除某 raw 项的一张截图（磁盘文件一并删除） */
+export function deleteSubmissionNoteImage(
+  submissionId: number,
+  key: string,
+  storedName: string
+): SubmissionRow {
+  const sub = findSubmission(submissionId);
+  if (!sub) throw notFound('投稿不存在');
+  const notes = subNotes(sub);
+  const note = notes[key];
+  const idx = note?.images.findIndex((f) => f.storedName === storedName) ?? -1;
+  if (!note || idx < 0) throw notFound('截图不存在');
+  const [removed] = note.images.splice(idx, 1);
+  deleteVideoFile(sub.seasonId, removed?.storedName ?? null);
+  updateNotes(sub.id, notes);
+  return findSubmission(sub.id)!;
+}
+
+/** 清除投稿全部截图（磁盘文件删除，文本保留）——定格 / 打回 / 撤销时调用 */
+export function purgeSubmissionNoteImages(sub: SubmissionRow): void {
+  const notes = subNotes(sub);
+  let changed = false;
+  for (const note of Object.values(notes)) {
+    if (!note?.images?.length) continue;
+    for (const img of note.images) deleteVideoFile(sub.seasonId, img.storedName);
+    note.images = [];
+    changed = true;
+  }
+  if (changed) updateNotes(sub.id, notes);
+}
+
 /** 创建一份空投稿（随后逐 raw key 上传视频，直至 complete） */
 export function createSubmission(params: {
   seasonId: number;
@@ -345,7 +432,7 @@ export function deleteSubmissionRow(id: number): void {
   db.prepare('DELETE FROM submissions WHERE id = ?').run(id);
 }
 
-/** 打回：判定作弊/无效，视频作废（文件删除由调用方处理） */
+/** 打回：判定作弊/无效，视频作废（视频文件删除由调用方处理；截图在本函数内清） */
 export function markRejected(params: {
   submissionId: number;
   by: string;
@@ -354,6 +441,7 @@ export function markRejected(params: {
   const sub = findSubmission(params.submissionId);
   if (!sub) throw notFound('投稿不存在');
   if (sub.status !== 'pending') throw conflict('只有待审核的投稿可以打回');
+  purgeSubmissionNoteImages(sub); // 打回后截图不再保留
   const t = now();
   db.prepare(
     `UPDATE submissions SET status = 'rejected', files_json = '{}', values_json = NULL, complete = 0,
@@ -362,11 +450,11 @@ export function markRejected(params: {
   return findSubmission(params.submissionId)!;
 }
 
+/** 审核提交/更新。备注字段已废弃：审核员备注仅本人可见无意义，一律不写（历史列保留） */
 export function upsertReview(params: {
   submissionId: number;
   reviewerQq: string;
   values: Record<string, number>;
-  comment: string | null;
 }): { created: boolean } {
   const t = now();
   const existing = one<{ id: number }>(
@@ -376,21 +464,14 @@ export function upsertReview(params: {
   );
   if (existing) {
     db.prepare(
-      'UPDATE reviews SET values_json = ?, comment = ?, updated_at = ? WHERE id = ?'
-    ).run(JSON.stringify(params.values), params.comment, t, existing.id);
+      'UPDATE reviews SET values_json = ?, comment = NULL, updated_at = ? WHERE id = ?'
+    ).run(JSON.stringify(params.values), t, existing.id);
     return { created: false };
   }
   db.prepare(
     `INSERT INTO reviews (submission_id, reviewer_qq, values_json, comment, created_at, updated_at)
-     VALUES (?,?,?,?,?,?)`
-  ).run(
-    params.submissionId,
-    params.reviewerQq,
-    JSON.stringify(params.values),
-    params.comment,
-    t,
-    t
-  );
+     VALUES (?,?,?,NULL,?,?)`
+  ).run(params.submissionId, params.reviewerQq, JSON.stringify(params.values), t, t);
   return { created: true };
 }
 
@@ -442,6 +523,7 @@ export function publishSubmission(submissionId: number): {
   db.prepare(
     `UPDATE submissions SET status = ?, values_json = ?, published_at = COALESCE(published_at, ?) WHERE id = ?`
   ).run(locked ? 'published' : 'pending', JSON.stringify(aggregated), t, submissionId);
+  if (locked) purgeSubmissionNoteImages(sub); // 审核通过（定格）后截图立即删除
   return { values: aggregated, reviewCount, locked };
 }
 
