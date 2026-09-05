@@ -8,6 +8,8 @@ import {
   seasonConfig,
   upsertManualScore,
   deleteManualScore,
+  findManualScore,
+  assembleBoard,
   listSubmissionsByUser,
   subFiles,
 } from '../repo.js';
@@ -18,6 +20,24 @@ import { deleteVideoFile } from '../lib/files.js';
 
 function isStaff(u: import('../types.js').UserRow | null): boolean {
   return !!u && (u.role === 'admin' || u.role === 'su');
+}
+
+/** 用户在某一期的当前成绩：手动值（若有）与自动审核最佳值（若无手动时改分可沿用） */
+function effectiveValues(seasonId: number, userQq: string) {
+  const manual = findManualScore(seasonId, userQq);
+  const cand = assembleBoard(seasonId).find(
+    (c) => c.userQq === userQq && !c.manual
+  );
+  return {
+    manual: manual
+      ? {
+          values: JSON.parse(manual.valuesJson) as Record<string, number>,
+          note: manual.note,
+          updatedAt: manual.updatedAt,
+        }
+      : null,
+    auto: cand ? { values: cand.values, total: cand.total } : null,
+  };
 }
 
 export const userAdminRoutes = new Elysia({ prefix: '/api/staff' })
@@ -71,7 +91,29 @@ export const userAdminRoutes = new Elysia({ prefix: '/api/staff' })
     return { ok: true };
   })
 
+  // ---------- 查看用户在某一期的当前成绩（手动 + 审核；供手动改分对话框预填） ----------
+  .get('/users/:qq/manual-score', async ({ params, headers, query }: any) => {
+    const u = requireUser(authUser(headers));
+    if (!isStaff(u)) throw forbidden('需要管理员权限');
+    const target = findUserByQq(String(params.qq));
+    if (!target) throw notFound('用户不存在');
+    const seasonId = Number(query?.seasonId ?? 0);
+    const season = findSeason(seasonId);
+    if (!season) throw notFound('赛季不存在');
+    const eff = effectiveValues(season.id, target.qq);
+    const values = eff.manual?.values ?? eff.auto?.values ?? null;
+    return {
+      ok: true,
+      season: { id: season.id, name: season.name, status: season.status },
+      source: eff.manual ? 'manual' : eff.auto ? 'auto' : null,
+      manual: eff.manual,
+      auto: eff.auto,
+      values,
+    };
+  })
+
   // ---------- 手动更新用户分数（管理员/SU，只允许 active 赛季） ----------
+  // values 支持「部分填写」：只填想修改的项，其余沿用该用户当前成绩（手动优先，其次审核成绩）
   .put('/users/:qq/manual-score', async ({ params, body, headers }: any) => {
     const u = requireUser(authUser(headers));
     if (!isStaff(u)) throw forbidden('需要管理员权限');
@@ -86,24 +128,44 @@ export const userAdminRoutes = new Elysia({ prefix: '/api/staff' })
     const cfg = seasonConfig(season);
     const valuesRaw = (body ?? {}).values as Record<string, unknown> | undefined;
     if (!valuesRaw || typeof valuesRaw !== 'object') throw badRequest('请填写成绩数据');
-    const values: Record<string, number> = {};
+    // 1) 本次显式提供的数值（可只填部分项目）
+    const provided: Record<string, number> = {};
     for (const item of cfg.items) {
+      if (valuesRaw[item.key] === undefined || valuesRaw[item.key] === null) continue;
       const v = valuesRaw[item.key];
       const n = typeof v === 'string' ? Number(v) : v;
       if (typeof n !== 'number' || !Number.isFinite(n)) {
         throw badRequest(`请填写有效的「${item.label}」数值`);
       }
-      values[item.key] = n;
+      provided[item.key] = n;
+    }
+    if (!Object.keys(provided).length) throw badRequest('请至少填写一项数值');
+
+    // 2) 未提供的项沿用：现有手动值 → 该用户审核成绩
+    const eff = effectiveValues(season.id, target.qq);
+    const base = eff.manual?.values ?? eff.auto?.values ?? null;
+    const merged: Record<string, number> = { ...(base ?? {}), ...provided };
+    const missing = cfg.items.filter((i) => merged[i.key] === undefined);
+    if (missing.length) {
+      throw badRequest(
+        `缺少「${missing.map((i) => i.label).join('、')}」的数值；该用户当前没有可沿用的成绩，请完整填写`
+      );
     }
 
     upsertManualScore({
       seasonId: season.id,
       userQq: target.qq,
-      values,
+      values: merged,
       note: typeof body?.note === 'string' && body.note ? String(body.note) : null,
       updatedBy: u.qq,
     });
-    return { ok: true, seasonId: season.id, userQq: target.qq, values };
+    return {
+      ok: true,
+      seasonId: season.id,
+      userQq: target.qq,
+      values: merged,
+      baseFrom: eff.manual ? 'manual' : eff.auto ? 'auto' : 'none',
+    };
   })
 
   // ---------- 清除手动改分（恢复为审核数据） ----------

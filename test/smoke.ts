@@ -345,6 +345,55 @@ async function main() {
   });
   check('已存在 0 审完整投稿时部分更新 409（与普通上传同规则）', pFull.status === 409, pFull.json);
 
+  console.log('== 手动改分支持部分修改 ==');
+  // 管理员查询玩家当前成绩（该期有审核成绩 → source=auto 可预填）
+  const mGet = await api(
+    `/api/staff/users/${owner}/manual-score?seasonId=${next.json.season.id}`,
+    { token: suLogin.token }
+  );
+  check(
+    '查询当前成绩（自动审核成绩可作基底）',
+    mGet.json.ok === true &&
+      mGet.json.source === 'auto' &&
+      mGet.json.values?.damage === 300 &&
+      mGet.json.values?.time === 33,
+    mGet.json
+  );
+  // 只改 damage：time 沿用审核成绩
+  const mPut = await api(`/api/staff/users/${owner}/manual-score`, {
+    method: 'PUT',
+    token: suLogin.token,
+    body: { seasonId: next.json.season.id, values: { damage: 301 } },
+  });
+  check(
+    '部分手动改分：damage 更新、time 沿用（baseFrom=auto）',
+    mPut.json.values?.damage === 301 &&
+      mPut.json.values?.time === 33 &&
+      mPut.json.baseFrom === 'auto',
+    mPut.json
+  );
+  // 第二次部分改分：以手动值为基底
+  const mPut2 = await api(`/api/staff/users/${owner}/manual-score`, {
+    method: 'PUT',
+    token: suLogin.token,
+    body: { seasonId: next.json.season.id, values: { time: 34 } },
+  });
+  check(
+    '再次部分改分：time=34 且 damage 保留手动 301',
+    mPut2.json.values?.damage === 301 && mPut2.json.values?.time === 34,
+    mPut2.json
+  );
+  const mPut3 = await api(`/api/staff/users/${owner}/manual-score`, {
+    method: 'PUT',
+    token: suLogin.token,
+    body: { seasonId: next.json.season.id, values: {} },
+  });
+  check('空 values 被拒', mPut3.status === 400, mPut3.json);
+  await api(`/api/staff/users/${owner}/manual-score/${next.json.season.id}`, {
+    method: 'DELETE',
+    token: suLogin.token,
+  });
+
   console.log('== 表达式扩展：raw key + max/min ==');
   const exprSeason = await api('/api/su/seasons/next', {
     method: 'POST',
@@ -595,6 +644,26 @@ async function main() {
     headers: { authorization: `Bearer ${suLogin.token}` },
   });
   check('未转码时 HLS 播放列表返回 404', m3u8.status === 404, m3u8.status);
+
+  console.log('== 玩家可撤销自己的成绩（含刊登中/已刊登） ==');
+  // 刊登中(2/3 快照)的投稿可撤销
+  const delMid = await api(`/api/submissions/${sid3}`, { method: 'DELETE', token: ownerToken });
+  check('可撤销刊登中(2/3)的投稿', delMid.json.ok === true, delMid.json);
+  // 已刊登(published, 3 审)的投稿也可撤销，成绩随即下榜
+  const delPub = await api(`/api/submissions/${sidNote}`, { method: 'DELETE', token: ownerToken });
+  check('可撤销已刊登(published)的投稿', delPub.json.ok === true, delPub.json);
+  const mineDel = await api('/api/submissions/mine', { token: ownerToken });
+  check(
+    '撤销后 mine 不再包含两份投稿',
+    !mineDel.json.submissions?.some((x: { id: number }) => x.id === sid3 || x.id === sidNote),
+    mineDel.json
+  );
+  const boardAfterDel = await api(`/api/leaderboard?seasonId=${exprSeasonId}`, { token: ownerToken });
+  check(
+    '撤销后成绩从榜单移除（该期玩家无成绩）',
+    !boardAfterDel.json.rows?.some((r: any) => r.qq === owner),
+    boardAfterDel.json
+  );
 
   console.log(`\n结果: ${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
